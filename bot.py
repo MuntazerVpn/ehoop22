@@ -7,9 +7,9 @@ import json
 import datetime
 
 # ==========================================
-# ⚙️ الإعدادات (التوكن الجديد)
+# ⚙️ الإعدادات (التوكن الجديد الخاص بك)
 # ==========================================
-BOT_TOKEN = '8439188737:AAFITCxXg3mUlZKB8B2gydyuGK16oQhiHQY'
+BOT_TOKEN = '8516502699:AAG-yW_GxMjBYtmnD7WhRDnPcONQ1a_qguc'
 bot = telebot.TeleBot(BOT_TOKEN)
 
 OWNER_ID = 8513261810
@@ -48,7 +48,7 @@ def check_subscription(user_id):
     except: return True 
 
 # ==========================================
-# 📥 دالة التحميل المحسنة (حل مشكلة يوتيوب)
+# 📥 دوال التحميل المحسنة
 # ==========================================
 def check_qualities(url):
     try:
@@ -72,7 +72,7 @@ def check_qualities(url):
 
 def download_content(url, quality, chat_id, msg_id):
     try:
-        # الإعدادات الذهبية لدمج الصوت والصورة تلقائياً
+        # إعدادات تضمن دمج الصوت والصورة بجودة عالية
         ydl_opts = {
             'outtmpl': '%(title)s.%(ext)s', 
             'quiet': True, 
@@ -86,13 +86,12 @@ def download_content(url, quality, chat_id, msg_id):
             ydl_opts.update({'format': 'bestaudio/best', 'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3'}]})
             bot.edit_message_text("جاري تحميل الصوت... 🎵", chat_id, msg_id)
         else:
-            bot.edit_message_text(f"جاري معالجة الفيديو بجودة {quality}p... 🚀", chat_id, msg_id)
+            bot.edit_message_text(f"جاري تحضير الفيديو... 🚀", chat_id, msg_id)
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             f = ydl.prepare_filename(info)
             
-            # التأكد من المسار النهائي بعد الدمج
             base, ext = os.path.splitext(f)
             if quality == 'audio': f = base + '.mp3'
             else:
@@ -101,11 +100,11 @@ def download_content(url, quality, chat_id, msg_id):
 
             return f, info.get('title', 'media')
     except Exception as e:
-        bot.edit_message_text(f"❌ فشل: {str(e)[:100]}", chat_id, msg_id)
+        bot.edit_message_text(f"❌ حدث خطأ: {str(e)[:100]}", chat_id, msg_id)
         return None, None
 
 # ==========================================
-# 🤖 معالجة الرسائل
+# 🤖 المعالجات
 # ==========================================
 @bot.message_handler(commands=['start'])
 def welcome(message):
@@ -113,20 +112,20 @@ def welcome(message):
     db = load_db()
     init_user(user_id, db)
     save_db(db)
-    bot.reply_to(message, "أهلاً بك! 👋\nأرسل رابط الفيديو للبدء بالتحميل.")
+    bot.reply_to(message, "أهلاً بك! 👋\nأرسل رابط فيديو من يوتيوب، تيك توك، أو انستقرام وسأقوم بتحميله لك.")
 
 @bot.message_handler(func=lambda m: m.text.startswith('http'))
 def get_link(m):
     user_id = m.from_user.id
     if not check_subscription(user_id):
-        bot.reply_to(m, "⚠️ اشترك في القناة أولاً: @eshop_2")
+        bot.reply_to(m, "⚠️ عذراً، يجب عليك الاشتراك في القناة أولاً: @eshop_2")
         return
 
     wait = bot.reply_to(m, "جاري الفحص... 🔎")
     res, title_or_error = check_qualities(m.text)
     
     if not res: 
-        bot.edit_message_text(f"❌ خطأ: {title_or_error[:100]}", m.chat.id, wait.message_id)
+        bot.edit_message_text(f"❌ خطأ: الرابط غير مدعوم أو محمي.", m.chat.id, wait.message_id)
         return
     
     user_urls[m.chat.id] = m.text
@@ -134,6 +133,7 @@ def get_link(m):
     if 'Best' in res:
         markup.add(types.InlineKeyboardButton("تحميل فيديو ✅", callback_data="q|Best"))
     else:
+        # عرض أول 6 جودات فقط لعدم ازدحام الأزرار
         btns = [types.InlineKeyboardButton(f"{r}p", callback_data=f"q|{r}") for r in res[:6]]
         markup.add(*btns)
     
@@ -147,13 +147,13 @@ def process(c):
     qual = c.data.split('|')[1]
     
     bot.delete_message(user_id, c.message.message_id)
-    msg = bot.send_message(user_id, "جاري البدء... ⏳")
+    msg = bot.send_message(user_id, "جاري المعالجة... ⏳")
     
     path, title = download_content(url, qual, user_id, msg.message_id)
     
     if path and os.path.exists(path):
         try:
-            bot.edit_message_text("جاري الرفع... 📤", user_id, msg.message_id)
+            bot.edit_message_text("جاري الرفع إلى تيليجرام... 📤", user_id, msg.message_id)
             with open(path, 'rb') as f:
                 if qual == 'audio': bot.send_audio(user_id, f, title=title)
                 else: bot.send_video(user_id, f, caption=title)
