@@ -164,4 +164,3 @@ def process(c):
             if os.path.exists(path): os.remove(path)
 
 bot.infinity_polling()
-    
