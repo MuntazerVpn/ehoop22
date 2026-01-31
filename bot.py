@@ -4,75 +4,120 @@ import json
 import time
 import threading
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 import telebot
 from telebot import types
 
 # =========================
-# CONFIG
+# CONFIG (أساسي)
 # =========================
 BOT_TOKEN = "8423770288:AAGPjI_9TZQXHUGj9bPn7yvORSwQQDHwGJA"
 ADMIN_ID = 6964811817
 
-if not BOT_TOKEN:
-    raise SystemExit("❌ BOT_TOKEN missing. Set BOT_TOKEN env var first.")
+if not BOT_TOKEN or BOT_TOKEN == "PUT_YOUR_TOKEN_HERE":
+    raise SystemExit("❌ BOT_TOKEN missing.")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 USERS_FILE = "users.json"
+SETTINGS_FILE = "settings.json"
+USAGE_FILE = "usage.json"
+STATS_FILE = "stats.json"
 COOKIES_FILE = "cookies.txt"
+
 EDIT_THROTTLE_SEC = 1.2
 
 user_links = {}
 chat_locks = {}
 active_downloads = {}  # chat_id -> {"proc": Popen, "cancel": Event, "dl_id": str, "msg_id": int}
 
+# =========================
+# DEFAULT SETTINGS
+# =========================
+DEFAULT_SETTINGS = {
+    "bot_enabled": True,
+    "bot_public_username": "@aass554411",  # رابط البوت يضاف مع المقاطع
+    "welcome_message": (
+        "👋 <b>هلا بيك!</b>\n"
+        "أنا بوت التحميل مالك: <b>منتظر</b>\n\n"
+        "✅ أرسل الرابط مباشرة\n"
+        "🔹 يوتيوب/تيك توك: <b>720p</b> أو <b>480p</b> أو <b>صوت</b>\n"
+        "🔹 إنستغرام: فيديو فقط\n\n"
+        "🛑 تقدر تلغي التحميل أثناء التشغيل\n"
+        "⚠️ الحد اليومي لكل مستخدم: <b>20 رابط</b>\n"
+        "—\n"
+        f"🔗 بوتي: {('@aass554411')}"
+    ),
+    "daily_limit": 20,
+    "forced_channels": [],  # مثال: ["@channel1", "@channel2"]
+    "buttons": {
+        "start_btn": "✅ بدء",
+        "admin_btn": "⚙️ ادمن",
+        "v720": "🎬 فيديو 720p",
+        "v480": "🎬 فيديو 480p",
+        "audio": "🎵 صوت فقط",
+        "ig_video": "📸 تحميل فيديو (إنستغرام)",
+        "cancel": "🛑 إلغاء التحميل",
+    },
+}
 
 # =========================
-# USERS (optional)
+# JSON HELPERS
 # =========================
-def load_users() -> dict:
-    if not os.path.exists(USERS_FILE):
-        return {}
+def _load_json(path: str, default):
+    if not os.path.exists(path):
+        return default
     try:
-        with open(USERS_FILE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except:
-        return {}
+        return default
 
-def save_users(data: dict) -> None:
+def _save_json(path: str, data):
     try:
-        with open(USERS_FILE, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except:
         pass
 
-def ensure_user(m):
-    users = load_users()
-    uid = str(m.from_user.id)
-    if uid not in users:
-        users[uid] = {
-            "first_name": m.from_user.first_name or "",
-            "username": (m.from_user.username or ""),
-            "added_at": datetime.utcnow().isoformat() + "Z",
-        }
-        save_users(users)
+settings_lock = threading.Lock()
+stats_lock = threading.Lock()
 
-        if ADMIN_ID:
-            total = len(users)
-            uname = f"@{m.from_user.username}" if m.from_user.username else "بدون"
-            name = (m.from_user.first_name or "بدون اسم")
-            bot.send_message(
-                ADMIN_ID,
-                "👤 <b>مستخدم جديد</b>\n"
-                f"• الاسم: {name}\n"
-                f"• المستخدم: {uname}\n"
-                f"• ID: <code>{m.from_user.id}</code>\n"
-                f"• عدد المستخدمين: <b>{total}</b>"
-            )
+def load_settings():
+    s = _load_json(SETTINGS_FILE, {})
+    merged = json.loads(json.dumps(DEFAULT_SETTINGS))
+    # merge shallow + nested buttons
+    for k, v in s.items():
+        if k == "buttons" and isinstance(v, dict):
+            merged["buttons"].update(v)
+        else:
+            merged[k] = v
+    return merged
 
+def save_settings(s):
+    _save_json(SETTINGS_FILE, s)
+
+def load_users() -> dict:
+    return _load_json(USERS_FILE, {})
+
+def save_users(data: dict) -> None:
+    _save_json(USERS_FILE, data)
+
+def load_usage() -> dict:
+    return _load_json(USAGE_FILE, {})
+
+def save_usage(d: dict):
+    _save_json(USAGE_FILE, d)
+
+def log_stat(event: dict):
+    with stats_lock:
+        stats = _load_json(STATS_FILE, [])
+        stats.append(event)
+        # قص آخر 5000 حدث
+        stats = stats[-5000:]
+        _save_json(STATS_FILE, stats)
 
 # =========================
 # BASIC HELPERS
@@ -90,7 +135,6 @@ def get_domain(url: str) -> str:
 
 def normalize_url(url: str) -> str:
     u = (url or "").strip()
-    # YouTube shorts -> watch
     m = re.search(r"(https?://)?(www\.)?youtube\.com/shorts/([A-Za-z0-9_-]{6,})", u)
     if m:
         vid = m.group(3)
@@ -103,51 +147,6 @@ def has_ffmpeg() -> bool:
         return True
     except:
         return False
-
-def common_ytdlp_args(domain: str):
-    # ✅ تحسينات مهمة لثبات يوتيوب (توقف بعد دقائق)
-    args = [
-        "--no-playlist",
-        "--no-color",
-        "--newline",
-        "--force-overwrites",
-
-        # retries/timeouts
-        "--socket-timeout", "30",
-        "--retries", "10",
-        "--fragment-retries", "10",
-        "--file-access-retries", "10",
-        "--retry-sleep", "1",
-
-        # شبكات كثيرة تستقر أكثر بهذا
-        "--force-ipv4",
-        "--concurrent-fragments", "1",
-    ]
-
-    # ✅ يوتيوب: android client يقلل مشاكل الحماية/الانقطاع
-    if "youtube.com" in domain or "youtu.be" in domain:
-        args += ["--extractor-args", "youtube:player_client=android"]
-
-    # Instagram headers + cookies
-    if "instagram.com" in domain:
-        args += [
-            "--user-agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-            "--add-header", "Referer:https://www.instagram.com/",
-            "--add-header", "Origin:https://www.instagram.com",
-            "--add-header", "Accept-Language:en-US,en;q=0.9,ar;q=0.8",
-        ]
-        if os.path.exists(COOKIES_FILE):
-            args += ["--cookies", COOKIES_FILE]
-
-    return args
-
-def find_file(prefix: str):
-    files = [f for f in os.listdir(".") if f.startswith(prefix)]
-    if not files:
-        return None
-    files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-    return files[0]
 
 def safe_filename(name: str, max_len: int = 80) -> str:
     name = re.sub(r'[\\/:*?"<>|\n\r\t]', "_", (name or "")).strip()
@@ -173,8 +172,12 @@ def seconds_to_hms(sec: int) -> str:
     except:
         return "غير معروف"
 
-def human_size(n: int | None) -> str:
+def human_size(n):
     if not n:
+        return "غير معروف"
+    try:
+        n = int(n)
+    except:
         return "غير معروف"
     units = ["B", "KB", "MB", "GB", "TB"]
     size = float(n)
@@ -183,11 +186,6 @@ def human_size(n: int | None) -> str:
         size /= 1024
         i += 1
     return f"{size:.2f} {units[i]}"
-
-def cancel_keyboard(dl_id: str):
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("🛑 إلغاء التحميل", callback_data=f"cancel:{dl_id}"))
-    return kb
 
 def stop_process(proc: subprocess.Popen):
     try:
@@ -203,41 +201,214 @@ def stop_process(proc: subprocess.Popen):
     except:
         pass
 
+def is_admin(user_id: int) -> bool:
+    return int(user_id) == int(ADMIN_ID)
 
 # =========================
-# FORMATS: 720 / 480 / AUDIO + Auto fallback
+# KEYBOARDS
 # =========================
+def start_keyboard():
+    s = load_settings()
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(s["buttons"]["start_btn"])
+    if ADMIN_ID:
+        kb.row(s["buttons"]["admin_btn"])
+    return kb
+
+def cancel_keyboard(dl_id: str):
+    s = load_settings()
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton(s["buttons"]["cancel"], callback_data=f"cancel:{dl_id}"))
+    return kb
+
+def admin_panel_kb():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("✉️ الترحيب", callback_data="adm:welcome"),
+        types.InlineKeyboardButton("🚫 حظر/فك", callback_data="adm:ban"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("🧷 الأزرار", callback_data="adm:buttons"),
+        types.InlineKeyboardButton("📢 إذاعة", callback_data="adm:broadcast"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("✅ اشتراك إجباري", callback_data="adm:force"),
+        types.InlineKeyboardButton("⏸️ تشغيل/إيقاف", callback_data="adm:toggle"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("🔁 إعادة تشغيل", callback_data="adm:restart"),
+        types.InlineKeyboardButton("📊 تقرير الآن", callback_data="adm:report"),
+    )
+    return kb
+
+def force_join_kb(channels: list):
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for ch in channels[:8]:
+        ch_disp = ch if ch.startswith("@") else f"@{ch}"
+        kb.add(types.InlineKeyboardButton(f"📌 {ch_disp}", url=f"https://t.me/{ch_disp.lstrip('@')}"))
+    kb.add(types.InlineKeyboardButton("✅ تحقّق", callback_data="force:check"))
+    return kb
+
+# =========================
+# USERS + BAN
+# =========================
+def ensure_user(m):
+    users = load_users()
+    uid = str(m.from_user.id)
+    if uid not in users:
+        users[uid] = {
+            "first_name": m.from_user.first_name or "",
+            "username": (m.from_user.username or ""),
+            "added_at": datetime.utcnow().isoformat() + "Z",
+            "banned": False,
+        }
+        save_users(users)
+
+        if ADMIN_ID:
+            total = len(users)
+            uname = f"@{m.from_user.username}" if m.from_user.username else "بدون"
+            name = (m.from_user.first_name or "بدون اسم")
+            bot.send_message(
+                ADMIN_ID,
+                "👤 <b>مستخدم جديد</b>\n"
+                f"• الاسم: {name}\n"
+                f"• المستخدم: {uname}\n"
+                f"• ID: <code>{m.from_user.id}</code>\n"
+                f"• عدد المستخدمين: <b>{total}</b>",
+                reply_markup=start_keyboard()
+            )
+
+def is_banned(user_id: int) -> bool:
+    users = load_users()
+    u = users.get(str(user_id))
+    return bool(u and u.get("banned"))
+
+def set_ban(user_id: int, banned: bool):
+    users = load_users()
+    uid = str(user_id)
+    if uid not in users:
+        users[uid] = {"first_name": "", "username": "", "added_at": datetime.utcnow().isoformat()+"Z"}
+    users[uid]["banned"] = bool(banned)
+    save_users(users)
+
+# =========================
+# BOT ENABLE / FORCED JOIN / LIMIT
+# =========================
+def bot_is_enabled_for(user_id: int) -> bool:
+    s = load_settings()
+    if s.get("bot_enabled", True):
+        return True
+    return is_admin(user_id)
+
+def check_forced_join(user_id: int) -> bool:
+    s = load_settings()
+    channels = s.get("forced_channels") or []
+    if not channels:
+        return True
+
+    for ch in channels:
+        try:
+            ch_id = ch
+            mem = bot.get_chat_member(ch_id, user_id)
+            if mem.status in ("left", "kicked"):
+                return False
+        except:
+            # إذا فشل الفحص لأي سبب اعتبره غير مشترك
+            return False
+    return True
+
+def daily_limit_ok(user_id: int) -> (bool, int, int):
+    s = load_settings()
+    limit = int(s.get("daily_limit", 20))
+    usage = load_usage()
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    key = str(user_id)
+    if key not in usage:
+        usage[key] = {}
+    cnt = int(usage[key].get(today, 0))
+    return (cnt < limit, cnt, limit)
+
+def inc_daily(user_id: int):
+    usage = load_usage()
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    key = str(user_id)
+    if key not in usage:
+        usage[key] = {}
+    usage[key][today] = int(usage[key].get(today, 0)) + 1
+    save_usage(usage)
+
+def refuse_plain(chat_id: int):
+    s = load_settings()
+    bot.send_message(
+        chat_id,
+        "⚠️ <b>أرسل رابط صحيح</b>\n"
+        "مثال: https://youtube.com/...\n\n"
+        f"اضغط {s['buttons']['start_btn']} للبدء.",
+        reply_markup=start_keyboard()
+    )
+
+# =========================
+# yt-dlp ARGS / FORMATS
+# =========================
+def common_ytdlp_args(domain: str):
+    args = [
+        "--no-playlist",
+        "--no-color",
+        "--newline",
+        "--force-overwrites",
+        "--socket-timeout", "30",
+        "--retries", "10",
+        "--fragment-retries", "10",
+        "--file-access-retries", "10",
+        "--retry-sleep", "1",
+        "--force-ipv4",
+        "--concurrent-fragments", "1",
+    ]
+    if "youtube.com" in domain or "youtu.be" in domain:
+        args += ["--extractor-args", "youtube:player_client=android"]
+
+    if "instagram.com" in domain:
+        args += [
+            "--user-agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            "--add-header", "Referer:https://www.instagram.com/",
+            "--add-header", "Origin:https://www.instagram.com",
+            "--add-header", "Accept-Language:en-US,en;q=0.9,ar;q=0.8",
+        ]
+        if os.path.exists(COOKIES_FILE):
+            args += ["--cookies", COOKIES_FILE]
+    return args
+
 def build_format(domain: str, mode: str) -> str:
     if mode == "ig_video":
-        # Instagram: فيديو فقط
         return "best[ext=mp4][vcodec!=none][acodec!=none]/best"
-
     if mode == "v_audio":
         return "bestaudio[ext=m4a]/bestaudio/best"
-
     if mode == "v_720":
-        # إذا 720 غير موجود => أي mp4 فيه فيديو+صوت => أي شيء
         return (
             "best[height<=720][ext=mp4][vcodec!=none][acodec!=none]/"
             "best[ext=mp4][vcodec!=none][acodec!=none]/"
             "best"
         )
-
     if mode == "v_480":
-        # إذا 480 غير موجود => أي mp4 فيه فيديو+صوت => أي شيء
         return (
             "best[height<=480][ext=mp4][vcodec!=none][acodec!=none]/"
             "best[ext=mp4][vcodec!=none][acodec!=none]/"
             "best"
         )
-
     return "best"
 
+def find_file(prefix: str):
+    files = [f for f in os.listdir(".") if f.startswith(prefix)]
+    if not files:
+        return None
+    files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    return files[0]
 
 # =========================
-# FETCH INFO BEFORE DOWNLOAD
+# FETCH INFO
 # =========================
-def fetch_info(url: str, fmt: str, domain: str) -> dict | None:
+def fetch_info(url: str, fmt: str, domain: str):
     try:
         cmd = ["yt-dlp"] + common_ytdlp_args(domain) + ["-f", fmt, "-J", url]
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
@@ -273,9 +444,8 @@ def fetch_info(url: str, fmt: str, domain: str) -> dict | None:
     except:
         return None
 
-
 # =========================
-# DOWNLOAD WITH PROGRESS + CANCEL + BETTER ERROR
+# DOWNLOAD WITH PROGRESS + CANCEL + SAFE FAIL NAMES
 # =========================
 def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
     url = normalize_url(url)
@@ -283,10 +453,8 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
 
     out_prefix = f"dl_{chat_id}_{int(time.time())}"
     out_tmpl = f"{out_prefix}.%(ext)s"
-
     fmt = build_format(domain, mode)
 
-    # ✅ معلومات قبل التحميل
     info = fetch_info(url, fmt, domain) or {}
     title = info.get("title", "بدون عنوان")
     channel = info.get("channel", "غير معروف")
@@ -310,13 +478,11 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
 
     extra_args = []
     if mode != "v_audio":
-        # فيديو: remux/merge mp4 لو ffmpeg موجود
         if has_ffmpeg():
             extra_args += ["--merge-output-format", "mp4", "--remux-video", "mp4"]
         else:
             extra_args += ["--format-sort", "ext:mp4"]
     else:
-        # صوت فقط: استخراج m4a
         if has_ffmpeg():
             extra_args += ["-x", "--audio-format", "m4a", "--audio-quality", "0"]
 
@@ -344,10 +510,11 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
             if cancel_event.is_set():
                 stop_process(proc)
                 try:
-                    bot.edit_message_text("🛑 تم إلغاء التحميل.", chat_id, msg_id)
+                    bot.edit_message_text("CANCELLED", chat_id, msg_id, reply_markup=start_keyboard())
                 except:
                     pass
-                return None, None, None
+                log_stat({"ts": time.time(), "type": "cancel", "chat_id": chat_id, "domain": domain})
+                return None, None, None, "CANCELLED"
 
             m = percent_re.search(line)
             if not m:
@@ -386,36 +553,46 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
                 pass
 
         ret = proc.wait()
-
         if cancel_event.is_set():
             try:
-                bot.edit_message_text("🛑 تم إلغاء التحميل.", chat_id, msg_id)
+                bot.edit_message_text("CANCELLED", chat_id, msg_id, reply_markup=start_keyboard())
             except:
                 pass
-            return None, None, None
+            log_stat({"ts": time.time(), "type": "cancel", "chat_id": chat_id, "domain": domain})
+            return None, None, None, "CANCELLED"
 
         if ret != 0:
-            # ✅ اعرض آخر سطور من لوج yt-dlp (يساعدك تعرف السبب الحقيقي)
             try:
-                # ما عدنا stdout هنا لأنه كان stream؛ نعرض رسالة عامة
-                bot.edit_message_text("❌ فشل التحميل (yt-dlp error).", chat_id, msg_id)
+                bot.edit_message_text("YT_DLP_ERROR", chat_id, msg_id, reply_markup=start_keyboard())
             except:
                 pass
-            return None, None, None
+            log_stat({"ts": time.time(), "type": "fail", "reason": "YT_DLP_ERROR", "chat_id": chat_id, "domain": domain})
+            return None, None, None, "YT_DLP_ERROR"
 
         path = find_file(out_prefix)
-        return path, title, channel
+        if not path:
+            try:
+                bot.edit_message_text("FILE_NOT_FOUND", chat_id, msg_id, reply_markup=start_keyboard())
+            except:
+                pass
+            log_stat({"ts": time.time(), "type": "fail", "reason": "FILE_NOT_FOUND", "chat_id": chat_id, "domain": domain})
+            return None, None, None, "FILE_NOT_FOUND"
 
-    except Exception as e:
+        return path, title, channel, None
+
+    except:
         try:
-            bot.edit_message_text(f"❌ فشل التحميل: {e}", chat_id, msg_id)
+            bot.edit_message_text("RUNTIME_ERROR", chat_id, msg_id, reply_markup=start_keyboard())
         except:
             pass
-        return None, None, None
-
+        log_stat({"ts": time.time(), "type": "fail", "reason": "RUNTIME_ERROR", "chat_id": chat_id, "domain": domain})
+        return None, None, None, "RUNTIME_ERROR"
 
 def send_result(chat_id: int, msg_id: int, path: str, mode: str, title: str, channel: str):
-    # rename
+    s = load_settings()
+    bot_link = s.get("bot_public_username") or "@aass554411"
+
+    # rename file
     base, ext = os.path.splitext(path)
     nice = safe_filename(title or "download")
     new_path = f"{nice}{ext}"
@@ -432,6 +609,8 @@ def send_result(chat_id: int, msg_id: int, path: str, mode: str, title: str, cha
     except:
         pass
 
+    caption_tail = f"\n\n🔗 {bot_link}"
+
     with open(path, "rb") as f:
         if mode == "v_audio":
             bot.send_audio(
@@ -439,13 +618,13 @@ def send_result(chat_id: int, msg_id: int, path: str, mode: str, title: str, cha
                 f,
                 title=title or "Audio",
                 performer=channel or "",
-                caption=f"🎵 {title}" if title else None
+                caption=(f"🎵 {title}" if title else "🎵") + caption_tail
             )
         else:
             bot.send_video(
                 chat_id,
                 f,
-                caption=f"🎬 {title}" if title else None,
+                caption=(f"🎬 {title}" if title else "🎬") + caption_tail,
                 supports_streaming=True
             )
 
@@ -459,8 +638,10 @@ def send_result(chat_id: int, msg_id: int, path: str, mode: str, title: str, cha
     except:
         pass
 
-
-def handle_download(chat_id, url, mode, status_msg_id):
+# =========================
+# DOWNLOAD FLOW
+# =========================
+def handle_download(chat_id, url, mode, status_msg_id, user_id):
     lock = get_lock(chat_id)
     if not lock.acquire(blocking=False):
         try:
@@ -469,6 +650,7 @@ def handle_download(chat_id, url, mode, status_msg_id):
             pass
         return
 
+    domain = get_domain(url)
     try:
         dl_id = f"{chat_id}:{int(time.time())}"
         active_downloads[chat_id] = {
@@ -478,11 +660,29 @@ def handle_download(chat_id, url, mode, status_msg_id):
             "msg_id": status_msg_id
         }
 
-        path, title, channel = ytdlp_download_with_progress(url, mode, chat_id, status_msg_id, dl_id)
+        path, title, channel, fail = ytdlp_download_with_progress(url, mode, chat_id, status_msg_id, dl_id)
+        if fail:
+            return
+
         if not path or not os.path.exists(path):
+            # بدون تفاصيل
+            try:
+                bot.edit_message_text("DOWNLOAD_FAILED", chat_id, status_msg_id, reply_markup=start_keyboard())
+            except:
+                pass
+            log_stat({"ts": time.time(), "type": "fail", "reason": "DOWNLOAD_FAILED", "chat_id": chat_id, "domain": domain})
             return
 
         send_result(chat_id, status_msg_id, path, mode, title, channel)
+        log_stat({
+            "ts": time.time(),
+            "type": "success",
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "domain": domain,
+            "mode": mode,
+            "title": title
+        })
 
     finally:
         try:
@@ -491,6 +691,88 @@ def handle_download(chat_id, url, mode, status_msg_id):
             pass
         lock.release()
 
+# =========================
+# ADMIN STATE MACHINE
+# =========================
+admin_states = {}  # admin_id -> {"step": str, "data": {}}
+
+def admin_set(step: str, data=None):
+    admin_states[str(ADMIN_ID)] = {"step": step, "data": data or {}}
+
+def admin_get():
+    return admin_states.get(str(ADMIN_ID), {"step": None, "data": {}})
+
+def admin_clear():
+    admin_states.pop(str(ADMIN_ID), None)
+
+# =========================
+# REPORT (كل 12 ساعة)
+# =========================
+def build_report(hours=12):
+    users = load_users()
+    usage = load_usage()
+    stats = _load_json(STATS_FILE, [])
+    cutoff = time.time() - hours * 3600
+
+    recent = [e for e in stats if e.get("ts", 0) >= cutoff]
+    ok = sum(1 for e in recent if e.get("type") == "success")
+    fail = sum(1 for e in recent if e.get("type") == "fail")
+    canc = sum(1 for e in recent if e.get("type") == "cancel")
+
+    # domains
+    dom = {}
+    for e in recent:
+        d = e.get("domain") or "unknown"
+        dom[d] = dom.get(d, 0) + 1
+    dom_sorted = sorted(dom.items(), key=lambda x: x[1], reverse=True)[:8]
+
+    # banned count
+    banned = sum(1 for u in users.values() if u.get("banned"))
+
+    # active
+    active_dl = len(active_downloads)
+
+    # اليوم
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    top_today = []
+    for uid, days in usage.items():
+        cnt = int(days.get(today, 0))
+        if cnt:
+            top_today.append((uid, cnt))
+    top_today.sort(key=lambda x: x[1], reverse=True)
+    top_today = top_today[:10]
+
+    dom_lines = "\n".join([f"• {d}: <b>{c}</b>" for d, c in dom_sorted]) or "• لا يوجد"
+    top_lines = "\n".join([f"• <code>{uid}</code>: <b>{cnt}</b>" for uid, cnt in top_today]) or "• لا يوجد"
+
+    s = load_settings()
+    forced = s.get("forced_channels") or []
+
+    return (
+        "📊 <b>تقرير استخدام البوت</b>\n"
+        f"🕒 آخر <b>{hours}</b> ساعة\n\n"
+        f"👥 المستخدمين: <b>{len(users)}</b>\n"
+        f"🚫 المحظورين: <b>{banned}</b>\n"
+        f"⬇️ تحميل ناجح: <b>{ok}</b>\n"
+        f"❌ فشل: <b>{fail}</b>\n"
+        f"🛑 إلغاء: <b>{canc}</b>\n"
+        f"⚙️ تحميلات نشطة الآن: <b>{active_dl}</b>\n\n"
+        "🌐 أكثر الدومينات:\n"
+        f"{dom_lines}\n\n"
+        "📌 الأعلى اليوم (حسب الروابط):\n"
+        f"{top_lines}\n\n"
+        "✅ الاشتراك الإجباري:\n"
+        + ("• لا يوجد\n" if not forced else "\n".join([f"• {ch}" for ch in forced]))
+    )
+
+def report_loop():
+    while True:
+        try:
+            if ADMIN_ID:
+                bot.send_message(ADMIN_ID, build_report(12), reply_markup=start_keyboard())
+        except:
+            pass
+        time.sleep(12 * 3600)
 
 # =========================
 # BOT HANDLERS
@@ -498,42 +780,125 @@ def handle_download(chat_id, url, mode, status_msg_id):
 @bot.message_handler(commands=["start"])
 def start(m):
     ensure_user(m)
-    bot.reply_to(
-        m,
-        "👋 <b>أرسل الرابط</b>\n\n"
-        "🔹 يوتيوب/تيك توك: <b>720p</b> أو <b>480p</b> أو <b>صوت</b>\n"
-        "🔹 إنستغرام: فيديو فقط\n\n"
-        "✅ معلومات قبل التحميل + نسبة التحميل %\n"
-        "🛑 زر إلغاء أثناء التحميل\n"
-    )
+    if is_banned(m.from_user.id):
+        return
 
+    if not bot_is_enabled_for(m.from_user.id):
+        bot.send_message(m.chat.id, "⛔ البوت متوقف مؤقتاً.", reply_markup=start_keyboard())
+        return
 
-@bot.message_handler(func=lambda m: m.text and m.text.strip().startswith("http"))
-def link(m):
+    s = load_settings()
+    bot.send_message(m.chat.id, s["welcome_message"], reply_markup=start_keyboard())
+
+@bot.message_handler(commands=["admin"])
+def admin_cmd(m):
+    if not is_admin(m.from_user.id):
+        return
+    admin_clear()
+    bot.send_message(m.chat.id, "⚙️ <b>لوحة الأدمن</b>", reply_markup=admin_panel_kb())
+
+@bot.message_handler(func=lambda m: True)
+def any_text(m):
     ensure_user(m)
-    url = normalize_url(m.text.strip())
+
+    # فحص تشغيل البوت
+    if not bot_is_enabled_for(m.from_user.id):
+        if is_admin(m.from_user.id):
+            pass
+        else:
+            bot.send_message(m.chat.id, "⛔ البوت متوقف مؤقتاً.", reply_markup=start_keyboard())
+            return
+
+    # حظر
+    if is_banned(m.from_user.id):
+        return
+
+    s = load_settings()
+    txt = (m.text or "").strip()
+
+    # زر بدء
+    if txt == s["buttons"]["start_btn"]:
+        bot.send_message(m.chat.id, s["welcome_message"], reply_markup=start_keyboard())
+        return
+
+    # زر ادمن
+    if txt == s["buttons"]["admin_btn"] and is_admin(m.from_user.id):
+        admin_clear()
+        bot.send_message(m.chat.id, "⚙️ <b>لوحة الأدمن</b>", reply_markup=admin_panel_kb())
+        return
+
+    # أدمن: استقبال خطوات الإدخال
+    if is_admin(m.from_user.id):
+        st = admin_get()
+        step = st.get("step")
+        if step:
+            handle_admin_input(m, step, st.get("data", {}))
+            return
+
+    # “.” أو أي شيء غير رابط
+    if not txt.startswith("http"):
+        refuse_plain(m.chat.id)
+        return
+
+    # رابط
+    url = normalize_url(txt)
     domain = get_domain(url)
     user_links[m.chat.id] = url
 
-    kb = types.InlineKeyboardMarkup(row_width=1)
+    # اشتراك إجباري
+    if not check_forced_join(m.from_user.id):
+        chans = load_settings().get("forced_channels") or []
+        bot.send_message(
+            m.chat.id,
+            "🔒 لازم تشترك بالقناة/القنوات أولاً ثم اضغط ✅ تحقّق",
+            reply_markup=force_join_kb(chans)
+        )
+        return
 
+    # حد يومي
+    ok, used, limit = daily_limit_ok(m.from_user.id)
+    if not ok:
+        bot.send_message(
+            m.chat.id,
+            f"⚠️ وصلت الحد اليومي.\n"
+            f"استخدامك اليوم: <b>{used}</b> / <b>{limit}</b>",
+            reply_markup=start_keyboard()
+        )
+        return
+
+    # أزرار الجودة
+    kb = types.InlineKeyboardMarkup(row_width=1)
     if "instagram.com" in domain:
-        kb.add(types.InlineKeyboardButton("📸 تحميل فيديو (إنستغرام)", callback_data="ig_video"))
+        kb.add(types.InlineKeyboardButton(load_settings()["buttons"]["ig_video"], callback_data="ig_video"))
     else:
+        b = load_settings()["buttons"]
         kb.add(
-            types.InlineKeyboardButton("🎬 فيديو 720p", callback_data="v_720"),
-            types.InlineKeyboardButton("🎬 فيديو 480p", callback_data="v_480"),
-            types.InlineKeyboardButton("🎵 صوت فقط", callback_data="v_audio"),
+            types.InlineKeyboardButton(b["v720"], callback_data="v_720"),
+            types.InlineKeyboardButton(b["v480"], callback_data="v_480"),
+            types.InlineKeyboardButton(b["audio"], callback_data="v_audio"),
         )
 
     bot.reply_to(m, "اختر الخيار 👇", reply_markup=kb)
 
+@bot.callback_query_handler(func=lambda c: c.data.startswith("force:check"))
+def force_check(c):
+    uid = c.from_user.id
+    if check_forced_join(uid):
+        bot.answer_callback_query(c.id, "✅ تم التحقق!")
+        bot.send_message(c.message.chat.id, "✅ تقدر ترسل الرابط الآن.", reply_markup=start_keyboard())
+    else:
+        bot.answer_callback_query(c.id, "❌ بعدك غير مشترك.")
+        chans = load_settings().get("forced_channels") or []
+        bot.send_message(
+            c.message.chat.id,
+            "🔒 لازم تشترك بالقناة/القنوات أولاً ثم اضغط ✅ تحقّق",
+            reply_markup=force_join_kb(chans)
+        )
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("cancel:"))
 def cancel_download(c):
     chat_id = c.message.chat.id
     dl = active_downloads.get(chat_id)
-
     if not dl:
         try:
             bot.answer_callback_query(c.id, "لا يوجد تحميل شغال الآن.")
@@ -559,15 +924,18 @@ def cancel_download(c):
     except:
         pass
     try:
-        bot.edit_message_text("🛑 تم إلغاء التحميل.", chat_id, dl.get("msg_id", c.message.message_id))
+        bot.edit_message_text("CANCELLED", chat_id, dl.get("msg_id", c.message.message_id), reply_markup=start_keyboard())
     except:
         pass
-
 
 @bot.callback_query_handler(func=lambda c: c.data in ["ig_video", "v_720", "v_480", "v_audio"])
 def process_choice(c):
     chat_id = c.message.chat.id
     url = user_links.get(chat_id)
+    uid = c.from_user.id
+
+    # حد يومي يزيد عند بدء التحميل (حتى لو فشل)
+    inc_daily(uid)
 
     try:
         bot.delete_message(chat_id, c.message.message_id)
@@ -577,23 +945,216 @@ def process_choice(c):
     msg = bot.send_message(chat_id, "⏳ بدء التحميل...")
 
     if not url:
-        bot.edit_message_text("❌ أرسل الرابط مرة ثانية.", chat_id, msg.message_id)
+        bot.edit_message_text("NO_URL", chat_id, msg.message_id, reply_markup=start_keyboard())
         return
 
     mode = c.data
-    t = threading.Thread(target=handle_download, args=(chat_id, url, mode, msg.message_id), daemon=True)
+    t = threading.Thread(target=handle_download, args=(chat_id, url, mode, msg.message_id, uid), daemon=True)
     t.start()
 
+# =========================
+# ADMIN PANEL CALLBACKS
+# =========================
+@bot.callback_query_handler(func=lambda c: c.data.startswith("adm:"))
+def admin_actions(c):
+    if not is_admin(c.from_user.id):
+        return
 
+    action = c.data.split(":", 1)[1]
+    bot.answer_callback_query(c.id)
+
+    if action == "welcome":
+        admin_set("welcome")
+        bot.send_message(c.message.chat.id, "✉️ ارسل <b>رسالة الترحيب الجديدة</b> الآن:")
+        return
+
+    if action == "ban":
+        admin_set("ban")
+        bot.send_message(c.message.chat.id, "🚫 ارسل ID المستخدم مع الأمر:\n<b>ban 123</b> أو <b>unban 123</b>")
+        return
+
+    if action == "buttons":
+        admin_set("buttons")
+        s = load_settings()
+        b = s["buttons"]
+        bot.send_message(
+            c.message.chat.id,
+            "🧷 ارسل صيغة تغيير الأزرار:\n"
+            "<code>v720=نص\nv480=نص\naudio=نص\nig_video=نص\nstart_btn=نص\nadmin_btn=نص\ncancel=نص</code>\n\n"
+            "📌 الحالي:\n"
+            f"v720: {b['v720']}\n"
+            f"v480: {b['v480']}\n"
+            f"audio: {b['audio']}\n"
+            f"ig_video: {b['ig_video']}\n"
+            f"start_btn: {b['start_btn']}\n"
+            f"admin_btn: {b['admin_btn']}\n"
+            f"cancel: {b['cancel']}"
+        )
+        return
+
+    if action == "broadcast":
+        admin_set("broadcast")
+        bot.send_message(c.message.chat.id, "📢 ارسل رسالة الإذاعة الآن (تروح لكل المستخدمين):")
+        return
+
+    if action == "force":
+        admin_set("force")
+        s = load_settings()
+        forced = s.get("forced_channels") or []
+        bot.send_message(
+            c.message.chat.id,
+            "✅ الاشتراك الإجباري:\n"
+            f"{('• لا يوجد' if not forced else ('\n'.join(['• '+x for x in forced])))}\n\n"
+            "اكتب:\n"
+            "<code>add @channel</code> لإضافة\n"
+            "<code>remove @channel</code> للحذف\n"
+            "<code>clear</code> لمسح الكل"
+        )
+        return
+
+    if action == "toggle":
+        with settings_lock:
+            s = load_settings()
+            s["bot_enabled"] = not bool(s.get("bot_enabled", True))
+            save_settings(s)
+        bot.send_message(
+            c.message.chat.id,
+            f"⏸️ الحالة الآن: <b>{'شغال' if s['bot_enabled'] else 'متوقف'}</b>",
+            reply_markup=admin_panel_kb()
+        )
+        return
+
+    if action == "restart":
+        bot.send_message(c.message.chat.id, "🔁 RESTARTING")
+        # إعادة تشغيل العملية
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)  # noqa
+        except:
+            bot.send_message(c.message.chat.id, "RESTART_FAILED")
+        return
+
+    if action == "report":
+        bot.send_message(c.message.chat.id, build_report(12), reply_markup=admin_panel_kb())
+        return
+
+def handle_admin_input(m, step: str, data: dict):
+    txt = (m.text or "").strip()
+
+    if step == "welcome":
+        with settings_lock:
+            s = load_settings()
+            s["welcome_message"] = txt
+            save_settings(s)
+        admin_clear()
+        bot.send_message(m.chat.id, "✅ تم تحديث الترحيب.", reply_markup=admin_panel_kb())
+        return
+
+    if step == "ban":
+        parts = txt.split()
+        if len(parts) == 2 and parts[0].lower() in ("ban", "unban"):
+            try:
+                uid = int(parts[1])
+                set_ban(uid, parts[0].lower() == "ban")
+                admin_clear()
+                bot.send_message(m.chat.id, "✅ تم.", reply_markup=admin_panel_kb())
+            except:
+                bot.send_message(m.chat.id, "INVALID_ID", reply_markup=admin_panel_kb())
+        else:
+            bot.send_message(m.chat.id, "INVALID_FORMAT", reply_markup=admin_panel_kb())
+        return
+
+    if step == "buttons":
+        # كل سطر key=value
+        updates = {}
+        for line in txt.splitlines():
+            line = line.strip()
+            if not line or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            if k and v:
+                updates[k] = v
+
+        allowed = {"v720", "v480", "audio", "ig_video", "start_btn", "admin_btn", "cancel"}
+        updates = {k: v for k, v in updates.items() if k in allowed}
+
+        if not updates:
+            bot.send_message(m.chat.id, "NO_CHANGES", reply_markup=admin_panel_kb())
+            return
+
+        with settings_lock:
+            s = load_settings()
+            s["buttons"].update(updates)
+            save_settings(s)
+
+        admin_clear()
+        bot.send_message(m.chat.id, "✅ تم تحديث الأزرار.", reply_markup=admin_panel_kb())
+        return
+
+    if step == "broadcast":
+        admin_clear()
+        users = load_users()
+        ok = 0
+        fail = 0
+        for uid_str, u in users.items():
+            try:
+                uid = int(uid_str)
+                if u.get("banned"):
+                    continue
+                bot.send_message(uid, txt, reply_markup=start_keyboard())
+                ok += 1
+            except:
+                fail += 1
+        bot.send_message(m.chat.id, f"📢 تم الإرسال.\n✅ وصل: <b>{ok}</b>\n❌ فشل: <b>{fail}</b>", reply_markup=admin_panel_kb())
+        return
+
+    if step == "force":
+        with settings_lock:
+            s = load_settings()
+            forced = s.get("forced_channels") or []
+            low = txt.lower().strip()
+
+            if low == "clear":
+                forced = []
+            elif low.startswith("add "):
+                ch = txt.split(" ", 1)[1].strip()
+                if ch and not ch.startswith("@"):
+                    ch = "@" + ch
+                if ch and ch not in forced:
+                    forced.append(ch)
+            elif low.startswith("remove "):
+                ch = txt.split(" ", 1)[1].strip()
+                if ch and not ch.startswith("@"):
+                    ch = "@" + ch
+                forced = [x for x in forced if x != ch]
+            else:
+                bot.send_message(m.chat.id, "INVALID_FORMAT", reply_markup=admin_panel_kb())
+                return
+
+            s["forced_channels"] = forced
+            save_settings(s)
+
+        admin_clear()
+        bot.send_message(m.chat.id, "✅ تم تحديث الاشتراك الإجباري.", reply_markup=admin_panel_kb())
+        return
+
+# =========================
+# RUN BOT
+# =========================
 def run_bot():
     while True:
         try:
             bot.remove_webhook()
             bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
-        except Exception as e:
-            print("Polling crashed:", e)
+        except:
+            # بدون تفاصيل
             time.sleep(5)
 
+if __name__ == "__main__":
+    # تشغيل تقرير كل 12 ساعة
+    if ADMIN_ID:
+        threading.Thread(target=report_loop, daemon=True).start()
 
-print("Bot running 🔥")
-run_bot()
+    print("Bot running 🔥")
+    run_bot()
