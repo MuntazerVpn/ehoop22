@@ -11,7 +11,7 @@ import telebot
 from telebot import types
 
 # =========================
-# CONFIG (Educational use)
+# CONFIG
 # =========================
 BOT_TOKEN = "8423770288:AAGPjI_9TZQXHUGj9bPn7yvORSwQQDHwGJA"
 ADMIN_ID = 6964811817
@@ -23,22 +23,16 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 USERS_FILE = "users.json"
 COOKIES_FILE = "cookies.txt"
-EDIT_THROTTLE_SEC = 1.2  # منع سبام تعديل الرسائل
+EDIT_THROTTLE_SEC = 1.2
 
-user_links = {}          # chat_id -> last url
-chat_locks = {}          # chat_id -> Lock
-active_downloads = {}    # chat_id -> {"proc": Popen, "cancel": Event, "dl_id": str, "msg_id": int}
+user_links = {}
+chat_locks = {}
+active_downloads = {}  # chat_id -> {"proc": Popen, "cancel": Event, "dl_id": str, "msg_id": int}
 
 
 # =========================
-# Helpers
+# USERS (optional)
 # =========================
-def get_lock(chat_id: int) -> threading.Lock:
-    if chat_id not in chat_locks:
-        chat_locks[chat_id] = threading.Lock()
-    return chat_locks[chat_id]
-
-
 def load_users() -> dict:
     if not os.path.exists(USERS_FILE):
         return {}
@@ -48,14 +42,12 @@ def load_users() -> dict:
     except:
         return {}
 
-
 def save_users(data: dict) -> None:
     try:
         with open(USERS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except:
         pass
-
 
 def ensure_user(m):
     users = load_users()
@@ -74,7 +66,7 @@ def ensure_user(m):
             name = (m.from_user.first_name or "بدون اسم")
             bot.send_message(
                 ADMIN_ID,
-                "👤 <b>مستخدم جديد دخل للبوت</b>\n"
+                "👤 <b>مستخدم جديد</b>\n"
                 f"• الاسم: {name}\n"
                 f"• المستخدم: {uname}\n"
                 f"• ID: <code>{m.from_user.id}</code>\n"
@@ -82,12 +74,19 @@ def ensure_user(m):
             )
 
 
+# =========================
+# BASIC HELPERS
+# =========================
+def get_lock(chat_id: int) -> threading.Lock:
+    if chat_id not in chat_locks:
+        chat_locks[chat_id] = threading.Lock()
+    return chat_locks[chat_id]
+
 def get_domain(url: str) -> str:
     try:
         return urlparse(url).netloc.lower().replace("www.", "")
     except:
         return ""
-
 
 def normalize_url(url: str) -> str:
     u = (url or "").strip()
@@ -98,7 +97,6 @@ def normalize_url(url: str) -> str:
         return f"https://www.youtube.com/watch?v={vid}"
     return u
 
-
 def has_ffmpeg() -> bool:
     try:
         subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
@@ -106,17 +104,29 @@ def has_ffmpeg() -> bool:
     except:
         return False
 
-
 def common_ytdlp_args(domain: str):
+    # ✅ تحسينات مهمة لثبات يوتيوب (توقف بعد دقائق)
     args = [
         "--no-playlist",
-        "--sleep-requests", "1",
-        "--sleep-interval", "1",
-        "--max-sleep-interval", "3",
         "--no-color",
         "--newline",
         "--force-overwrites",
+
+        # retries/timeouts
+        "--socket-timeout", "30",
+        "--retries", "10",
+        "--fragment-retries", "10",
+        "--file-access-retries", "10",
+        "--retry-sleep", "1",
+
+        # شبكات كثيرة تستقر أكثر بهذا
+        "--force-ipv4",
+        "--concurrent-fragments", "1",
     ]
+
+    # ✅ يوتيوب: android client يقلل مشاكل الحماية/الانقطاع
+    if "youtube.com" in domain or "youtu.be" in domain:
+        args += ["--extractor-args", "youtube:player_client=android"]
 
     # Instagram headers + cookies
     if "instagram.com" in domain:
@@ -132,7 +142,6 @@ def common_ytdlp_args(domain: str):
 
     return args
 
-
 def find_file(prefix: str):
     files = [f for f in os.listdir(".") if f.startswith(prefix)]
     if not files:
@@ -140,14 +149,10 @@ def find_file(prefix: str):
     files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
     return files[0]
 
-
 def safe_filename(name: str, max_len: int = 80) -> str:
     name = re.sub(r'[\\/:*?"<>|\n\r\t]', "_", (name or "")).strip()
     name = re.sub(r"\s+", " ", name)
-    if not name:
-        name = "download"
-    return name[:max_len]
-
+    return (name[:max_len] if name else "download")
 
 def fmt_upload_date(upload_date: str) -> str:
     try:
@@ -155,7 +160,6 @@ def fmt_upload_date(upload_date: str) -> str:
         return dt.strftime("%Y-%m-%d")
     except:
         return upload_date or "غير معروف"
-
 
 def seconds_to_hms(sec: int) -> str:
     try:
@@ -169,7 +173,6 @@ def seconds_to_hms(sec: int) -> str:
     except:
         return "غير معروف"
 
-
 def human_size(n: int | None) -> str:
     if not n:
         return "غير معروف"
@@ -181,11 +184,60 @@ def human_size(n: int | None) -> str:
         i += 1
     return f"{size:.2f} {units[i]}"
 
+def cancel_keyboard(dl_id: str):
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("🛑 إلغاء التحميل", callback_data=f"cancel:{dl_id}"))
+    return kb
 
+def stop_process(proc: subprocess.Popen):
+    try:
+        proc.terminate()
+    except:
+        pass
+    for _ in range(10):
+        if proc.poll() is not None:
+            return
+        time.sleep(0.2)
+    try:
+        proc.kill()
+    except:
+        pass
+
+
+# =========================
+# FORMATS: 720 / 480 / AUDIO + Auto fallback
+# =========================
+def build_format(domain: str, mode: str) -> str:
+    if mode == "ig_video":
+        # Instagram: فيديو فقط
+        return "best[ext=mp4][vcodec!=none][acodec!=none]/best"
+
+    if mode == "v_audio":
+        return "bestaudio[ext=m4a]/bestaudio/best"
+
+    if mode == "v_720":
+        # إذا 720 غير موجود => أي mp4 فيه فيديو+صوت => أي شيء
+        return (
+            "best[height<=720][ext=mp4][vcodec!=none][acodec!=none]/"
+            "best[ext=mp4][vcodec!=none][acodec!=none]/"
+            "best"
+        )
+
+    if mode == "v_480":
+        # إذا 480 غير موجود => أي mp4 فيه فيديو+صوت => أي شيء
+        return (
+            "best[height<=480][ext=mp4][vcodec!=none][acodec!=none]/"
+            "best[ext=mp4][vcodec!=none][acodec!=none]/"
+            "best"
+        )
+
+    return "best"
+
+
+# =========================
+# FETCH INFO BEFORE DOWNLOAD
+# =========================
 def fetch_info(url: str, fmt: str, domain: str) -> dict | None:
-    """
-    معلومات قبل التحميل: عنوان/قناة/تاريخ/مدة/حجم تقريبي
-    """
     try:
         cmd = ["yt-dlp"] + common_ytdlp_args(domain) + ["-f", fmt, "-J", url]
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
@@ -222,61 +274,8 @@ def fetch_info(url: str, fmt: str, domain: str) -> dict | None:
         return None
 
 
-def cancel_keyboard(dl_id: str):
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("🛑 إلغاء التحميل", callback_data=f"cancel:{dl_id}"))
-    return kb
-
-
-def stop_process(proc: subprocess.Popen):
-    try:
-        proc.terminate()
-    except:
-        pass
-    for _ in range(10):
-        if proc.poll() is not None:
-            return
-        time.sleep(0.2)
-    try:
-        proc.kill()
-    except:
-        pass
-
-
 # =========================
-# Format selection: ONLY 720 / 480 / audio
-# إذا غير متوفرين => ينزل أي جودة تلقائيًا
-# =========================
-def build_format(domain: str, mode: str) -> str:
-    # Instagram: فيديو فقط
-    if mode == "ig_video":
-        return "best[ext=mp4][vcodec!=none][acodec!=none]/best"
-
-    # Audio
-    if mode == "v_audio":
-        return "bestaudio[ext=m4a]/bestaudio/best"
-
-    # Video 720
-    if mode == "v_720":
-        return (
-            "best[height<=720][ext=mp4][vcodec!=none][acodec!=none]/"
-            "best[ext=mp4][vcodec!=none][acodec!=none]/"
-            "best"
-        )
-
-    # Video 480
-    if mode == "v_480":
-        return (
-            "best[height<=480][ext=mp4][vcodec!=none][acodec!=none]/"
-            "best[ext=mp4][vcodec!=none][acodec!=none]/"
-            "best"
-        )
-
-    return "best"
-
-
-# =========================
-# Download with progress + info + cancel
+# DOWNLOAD WITH PROGRESS + CANCEL + BETTER ERROR
 # =========================
 def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
     url = normalize_url(url)
@@ -287,7 +286,7 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
 
     fmt = build_format(domain, mode)
 
-    # معلومات قبل التحميل ✅
+    # ✅ معلومات قبل التحميل
     info = fetch_info(url, fmt, domain) or {}
     title = info.get("title", "بدون عنوان")
     channel = info.get("channel", "غير معروف")
@@ -311,11 +310,13 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
 
     extra_args = []
     if mode != "v_audio":
+        # فيديو: remux/merge mp4 لو ffmpeg موجود
         if has_ffmpeg():
             extra_args += ["--merge-output-format", "mp4", "--remux-video", "mp4"]
         else:
             extra_args += ["--format-sort", "ext:mp4"]
     else:
+        # صوت فقط: استخراج m4a
         if has_ffmpeg():
             extra_args += ["-x", "--audio-format", "m4a", "--audio-quality", "0"]
 
@@ -385,6 +386,7 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
                 pass
 
         ret = proc.wait()
+
         if cancel_event.is_set():
             try:
                 bot.edit_message_text("🛑 تم إلغاء التحميل.", chat_id, msg_id)
@@ -393,7 +395,9 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
             return None, None, None
 
         if ret != 0:
+            # ✅ اعرض آخر سطور من لوج yt-dlp (يساعدك تعرف السبب الحقيقي)
             try:
+                # ما عدنا stdout هنا لأنه كان stream؛ نعرض رسالة عامة
                 bot.edit_message_text("❌ فشل التحميل (yt-dlp error).", chat_id, msg_id)
             except:
                 pass
@@ -411,7 +415,7 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
 
 
 def send_result(chat_id: int, msg_id: int, path: str, mode: str, title: str, channel: str):
-    # rename to title
+    # rename
     base, ext = os.path.splitext(path)
     nice = safe_filename(title or "download")
     new_path = f"{nice}{ext}"
@@ -489,7 +493,7 @@ def handle_download(chat_id, url, mode, status_msg_id):
 
 
 # =========================
-# BOT Handlers
+# BOT HANDLERS
 # =========================
 @bot.message_handler(commands=["start"])
 def start(m):
@@ -499,9 +503,8 @@ def start(m):
         "👋 <b>أرسل الرابط</b>\n\n"
         "🔹 يوتيوب/تيك توك: <b>720p</b> أو <b>480p</b> أو <b>صوت</b>\n"
         "🔹 إنستغرام: فيديو فقط\n\n"
-        "✅ يعرض معلومات قبل التحميل + نسبة التحميل %\n"
-        "🛑 زر إلغاء أثناء التحميل\n\n"
-        "📚 <i>هذا البوت لأغراض تعليمية.</i>"
+        "✅ معلومات قبل التحميل + نسبة التحميل %\n"
+        "🛑 زر إلغاء أثناء التحميل\n"
     )
 
 
@@ -577,7 +580,7 @@ def process_choice(c):
         bot.edit_message_text("❌ أرسل الرابط مرة ثانية.", chat_id, msg.message_id)
         return
 
-    mode = c.data  # ig_video / v_720 / v_480 / v_audio
+    mode = c.data
     t = threading.Thread(target=handle_download, args=(chat_id, url, mode, msg.message_id), daemon=True)
     t.start()
 
@@ -592,5 +595,5 @@ def run_bot():
             time.sleep(5)
 
 
-print("Bot running 🔥 (Educational use)")
+print("Bot running 🔥")
 run_bot()
