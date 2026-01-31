@@ -43,10 +43,4 @@ def download_content(url, quality, chat_id, msg_id):
 
     except Exception as e:
         bot.edit_message_text(f"خطأ: {str(e)[:100]}", chat_id, msg_id)
-        return None, None  os.remove(path)
-    else:
-        bot.edit_message_text(f"فشل التحميل ❌\n{title}", message.chat.id, msg.message_id)
-
-print("Bot Started on Railway...")
-
-bot.infinity_polling()
+        return None, None
