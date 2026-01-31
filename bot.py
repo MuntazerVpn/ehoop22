@@ -93,19 +93,14 @@ def get_domain(url: str) -> str:
 
 
 def normalize_url(url: str) -> str:
-    """
-    تحسين دعم Shorts/Reels بشكل أفضل:
-    - YouTube Shorts: تحويل /shorts/ID إلى watch?v=ID
-    """
     u = url.strip()
 
-    # YouTube shorts
+    # YouTube shorts -> watch
     m = re.search(r"(https?://)?(www\.)?youtube\.com/shorts/([A-Za-z0-9_-]{6,})", u)
     if m:
         vid = m.group(3)
         return f"https://www.youtube.com/watch?v={vid}"
 
-    # youtu.be short link stays okay
     return u
 
 
@@ -125,9 +120,10 @@ def common_ytdlp_args(domain: str):
         "--max-sleep-interval", "3",
         "--no-color",
         "--newline",
+        "--force-overwrites",
     ]
 
-    # Instagram: headers + cookies إن وجدت
+    # Instagram: headers + cookies
     if "instagram.com" in domain:
         args += [
             "--user-agent",
@@ -138,9 +134,6 @@ def common_ytdlp_args(domain: str):
         ]
         if os.path.exists(COOKIES_FILE):
             args += ["--cookies", COOKIES_FILE]
-
-    if has_ffmpeg():
-        args += ["--merge-output-format", "mp4"]
 
     return args
 
@@ -190,18 +183,15 @@ def fetch_info(url: str, fmt: str, domain: str) -> dict | None:
     try:
         cmd = ["yt-dlp"] + common_ytdlp_args(domain) + ["-f", fmt, "-J", url]
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-
         if p.returncode != 0 or not p.stdout.strip():
             return None
 
         info = json.loads(p.stdout)
-
         title = info.get("title") or "بدون عنوان"
         channel = info.get("channel") or info.get("uploader") or info.get("uploader_id") or "غير معروف"
         upload_date = fmt_upload_date(info.get("upload_date") or "")
         duration = seconds_to_hms(info.get("duration") or 0)
 
-        # تقدير الحجم (قد لا يكون متاحًا دائمًا)
         size_bytes = None
         if isinstance(info.get("requested_formats"), list) and info["requested_formats"]:
             sizes = []
@@ -233,29 +223,25 @@ def find_file(prefix: str):
     return files[0]
 
 
+# ✅ هنا أهم تعديل: فورمات فيديو MP4 (H.264 + AAC) حتى ما يطلع صوت فقط
 def build_format(domain: str, mode: str) -> str:
-    ff = has_ffmpeg()
-
-    # Instagram: فيديو فقط (مناسب للريلز)
+    # Instagram video
     if mode == "ig_video":
-        if ff:
-            return "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-        return "best[ext=mp4][vcodec^=avc1]/best[ext=mp4]/best"
+        return "bv*[vcodec^=avc1]+ba[ext=m4a]/b[ext=mp4]/b"
 
     # Audio only
     if mode.endswith("_audio"):
-        return "bestaudio/best"
+        return "bestaudio[ext=m4a]/bestaudio/best"
 
-    # Fixed resolutions
+    # Fixed resolutions (MP4/H.264 + m4a)
     if mode.endswith("_720"):
-        return "bestvideo[height<=720][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<=720]/best"
+        return "bv*[height<=720][vcodec^=avc1]+ba[ext=m4a]/b[height<=720][ext=mp4]/b[ext=mp4]/b"
     if mode.endswith("_480"):
-        return "bestvideo[height<=480][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<=480]/best"
+        return "bv*[height<=480][vcodec^=avc1]+ba[ext=m4a]/b[height<=480][ext=mp4]/b[ext=mp4]/b"
     if mode.endswith("_360"):
-        return "bestvideo[height<=360][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<=360]/best"
+        return "bv*[height<=360][vcodec^=avc1]+ba[ext=m4a]/b[height<=360][ext=mp4]/b[ext=mp4]/b"
 
-    # fallback
-    return "best"
+    return "b[ext=mp4]/b"
 
 
 def cancel_keyboard(dl_id: str):
@@ -269,7 +255,6 @@ def stop_process(proc: subprocess.Popen):
         proc.terminate()
     except:
         pass
-    # kill if still alive
     for _ in range(10):
         if proc.poll() is not None:
             return
@@ -305,29 +290,36 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
         f"📦 <b>الحجم التقريبي:</b> {size_str}\n\n"
         "⬇️ <b>التحميل:</b> 0%"
     )
-
     try:
         bot.edit_message_text(pre, chat_id, msg_id, reply_markup=cancel_keyboard(dl_id))
     except:
         pass
 
-    cmd = ["yt-dlp"] + common_ytdlp_args(domain) + [
-        "-f", fmt,
-        "-o", out_tmpl,
-        url
-    ]
+    # ✅ فيديو: remux + merge mp4 (يتطلب ffmpeg)
+    extra_args = []
+    if not mode.endswith("_audio"):
+        # لو ffmpeg غير موجود، كثير احتمال يطلع صوت فقط/ملف غير مناسب
+        if has_ffmpeg():
+            extra_args += ["--merge-output-format", "mp4", "--remux-video", "mp4"]
+        else:
+            # بدون ffmpeg نحاول نحدّه لـ mp4 فقط
+            extra_args += ["--format-sort", "ext:mp4"]
+
+    # ✅ صوت فقط: استخراج m4a (يتطلب ffmpeg إذا كان التحويل لازم)
+    if mode.endswith("_audio"):
+        if has_ffmpeg():
+            extra_args += ["-x", "--audio-format", "m4a", "--audio-quality", "0"]
+
+    cmd = ["yt-dlp"] + common_ytdlp_args(domain) + ["-f", fmt] + extra_args + ["-o", out_tmpl, url]
 
     percent_re = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
     eta_re = re.compile(r"ETA\s+(\d+:\d+|\d+)")
     speed_re = re.compile(r"at\s+([0-9.]+\w+/s)")
 
     last_update_t = 0.0
-    last_percent_int = -1
-
     cancel_event = active_downloads[chat_id]["cancel"]
 
     try:
-        # start process
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -336,7 +328,6 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
             bufsize=1,
             universal_newlines=True
         )
-
         active_downloads[chat_id]["proc"] = proc
 
         for line in proc.stdout:
@@ -352,16 +343,10 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
             if not m:
                 continue
 
-            pct = float(m.group(1))
-            pct_int = int(pct)
-
+            pct_int = int(float(m.group(1)))
             now = time.time()
-            if pct_int == last_percent_int and (now - last_update_t) < EDIT_THROTTLE_SEC:
-                continue
             if (now - last_update_t) < EDIT_THROTTLE_SEC:
                 continue
-
-            last_percent_int = pct_int
             last_update_t = now
 
             eta_m = eta_re.search(line)
@@ -385,7 +370,6 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
                 f"⬇️ <b>التحميل:</b> {pct_int}%"
                 + (f"\n{' | '.join(extra)}" if extra else "")
             )
-
             try:
                 bot.edit_message_text(progress_text, chat_id, msg_id, reply_markup=cancel_keyboard(dl_id))
             except:
@@ -448,7 +432,8 @@ def send_result(chat_id: int, msg_id: int, path: str, mode: str, title: str, cha
             bot.send_video(
                 chat_id,
                 f,
-                caption=f"🎬 {title}" if title else None
+                caption=f"🎬 {title}" if title else None,
+                supports_streaming=True  # ✅ يساعد تيليجرام يعرض الفيديو صح
             )
 
     try:
@@ -472,7 +457,6 @@ def handle_download(chat_id, url, mode, status_msg_id):
         return
 
     try:
-        # create download session id
         dl_id = f"{chat_id}:{int(time.time())}"
         active_downloads[chat_id] = {
             "proc": None,
@@ -482,15 +466,12 @@ def handle_download(chat_id, url, mode, status_msg_id):
         }
 
         path, title, channel = ytdlp_download_with_progress(url, mode, chat_id, status_msg_id, dl_id)
-
-        # if canceled or failed
         if not path or not os.path.exists(path):
             return
 
         send_result(chat_id, status_msg_id, path, mode, title, channel)
 
     finally:
-        # cleanup
         try:
             active_downloads.pop(chat_id, None)
         except:
@@ -556,7 +537,6 @@ def cancel_download(c):
     chat_id = c.message.chat.id
     dl = active_downloads.get(chat_id)
 
-    # لو ماكو تحميل فعّال
     if not dl:
         try:
             bot.answer_callback_query(c.id, "لا يوجد تحميل شغال الآن.")
@@ -564,7 +544,6 @@ def cancel_download(c):
             pass
         return
 
-    # تأكد أنه نفس الجلسة
     dl_id = c.data.split(":", 1)[1]
     if dl.get("dl_id") != dl_id:
         try:
@@ -597,7 +576,6 @@ def process_choice(c):
     chat_id = c.message.chat.id
     url = user_links.get(chat_id)
 
-    # امسح لوحة الاختيارات
     try:
         bot.delete_message(chat_id, c.message.message_id)
     except:
@@ -609,7 +587,6 @@ def process_choice(c):
         bot.edit_message_text("❌ أرسل الرابط مرة ثانية.", chat_id, msg.message_id)
         return
 
-    # تشغيل التحميل في Thread
     t = threading.Thread(
         target=handle_download,
         args=(chat_id, url, c.data, msg.message_id),
