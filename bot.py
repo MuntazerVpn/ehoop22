@@ -1,8 +1,7 @@
 import telebot
 from telebot import types
-import yt_dlp
+import requests
 import os
-import time
 import json
 import datetime
 
@@ -45,59 +44,99 @@ def check_subscription(user_id):
     except: return True 
 
 # ==========================================
-# 📥 دوال التحميل (تحديث التجاوز 2026)
+# 📥 دالة التحميل عبر Cobalt API
 # ==========================================
 def download_content(url, quality, chat_id, msg_id):
     try:
-        ydl_opts = {
-            'outtmpl': '%(title)s.%(ext)s', 
-            'quiet': True, 
-            'no_warnings': True,
-            'nocheckcertificate': True,
-            # ✅ استخدام User-Agent لمتصفح Chrome حديث جداً (نظام ويندوز)
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-            # ✅ إضافة رؤوس طلبات لمحاكاة تصفح حقيقي
-            'http_headers': {
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Sec-Fetch-Mode': 'navigate',
-            },
-            # ✅ استخدام مشغل الويب المحمول (mweb) لتجاوز قيود DRM
-            'extractor_args': {'youtube': {'player_client': ['mweb', 'web_embedded']}},
-            'format': 'bestvideo+bestaudio/best', 
-            'merge_output_format': 'mp4',
-            'ignoreerrors': False,
+        # رابط الجسر الخاص بـ Cobalt
+        api_url = "https://api.cobalt.tools/api/json"
+        
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json"
         }
         
-        if quality == 'audio':
-            ydl_opts.update({'format': 'bestaudio/best', 'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3'}]})
-            bot.edit_message_text("جاري استخراج الصوت... 🎵", chat_id, msg_id)
-        else:
-            bot.edit_message_text(f"جاري جلب الفيديو بجودة {quality}p... 🚀", chat_id, msg_id)
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            f = ydl.prepare_filename(info)
-            
-            base, ext = os.path.splitext(f)
-            if quality == 'audio': f = base + '.mp3'
-            else:
-                if os.path.exists(base + '.mp4'): f = base + '.mp4'
-                elif os.path.exists(base + '.mkv'): f = base + '.mkv'
-
-            return f, info.get('title', 'media')
-            
-    except Exception as e:
-        err = str(e)
-        # ✅ رسائل خطأ واضحة للمستخدم
-        if "403" in err:
-            msg = "❌ السيرفر محظور حالياً من يوتيوب. يرجى المحاولة لاحقاً."
-        elif "DRM" in err:
-            msg = "⚠️ هذا الفيديو محمي ولا يمكن تحميله برمجياً."
-        else:
-            msg = f"❌ فشل: {err[:50]}..."
+        payload = {
+            "url": url,
+            "vQuality": "720", 
+            "isAudioOnly": True if quality == 'audio' else False,
+            "filenameStyle": "pretty"
+        }
         
-        bot.edit_message_text(msg, chat_id, msg_id)
+        bot.edit_message_text("🔄 جاري تجاوز الحماية عبر Cobalt Bridge...", chat_id, msg_id)
+        
+        # إرسال الطلب للجسر
+        response = requests.post(api_url, json=payload, headers=headers)
+        result = response.json()
+        
+        if result.get("status") in ["stream", "picker", "redirect"]:
+            direct_link = result.get("url")
+            
+            bot.edit_message_text("📥 جاري سحب الملف إلى السيرفر...", chat_id, msg_id)
+            
+            # تحميل الملف من الرابط المباشر
+            file_response = requests.get(direct_link, stream=True)
+            file_name = f"iShop_{chat_id}.mp4" if quality != 'audio' else f"iShop_{chat_id}.mp3"
+            
+            with open(file_name, "wb") as f:
+                for chunk in file_response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            return file_name, result.get("text", "Video")
+        else:
+            bot.edit_message_text(f"❌ Cobalt Error: {result.get('text', 'Unknown Error')}", chat_id, msg_id)
+            return None, None
+
+    except Exception as e:
+        bot.edit_message_text(f"❌ خطأ في الجسر: {str(e)[:100]}", chat_id, msg_id)
         return None, None
 
-# (استخدم بقية المعالجات من الكود الأصلي)
+# ==========================================
+# 🤖 المعالجات
+# ==========================================
+@bot.message_handler(commands=['start'])
+def welcome(message):
+    user_id = message.from_user.id
+    db = load_db()
+    init_user(user_id, db)
+    save_db(db)
+    bot.reply_to(message, "أهلاً بك في iShop! 👋\nتم تفعيل التحميل عبر Cobalt Bridge بنجاح.")
+
+@bot.message_handler(func=lambda m: m.text.startswith('http'))
+def get_link(m):
+    user_id = m.from_user.id
+    if not check_subscription(user_id):
+        bot.reply_to(m, f"⚠️ اشترك في القناة أولاً: {CHANNEL_USERNAME}")
+        return
+
+    user_urls[m.chat.id] = m.text
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("تحميل فيديو ✅", callback_data="q|Best"),
+               types.InlineKeyboardButton("صوت (MP3) 🎵", callback_data="q|audio"))
+    
+    bot.reply_to(m, "🎬 تم العثور على الرابط، اختر الصيغة:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('q|'))
+def process(c):
+    user_id = c.message.chat.id
+    url = user_urls.get(user_id)
+    qual = c.data.split('|')[1]
+    
+    bot.delete_message(user_id, c.message.message_id)
+    msg = bot.send_message(user_id, "⏳ جاري البدء عبر الجسر...")
+    
+    path, title = download_content(url, qual, user_id, msg.message_id)
+    
+    if path and os.path.exists(path):
+        try:
+            bot.edit_message_text("📤 جاري الرفع إلى تيليجرام...", user_id, msg.message_id)
+            with open(path, 'rb') as f:
+                if qual == 'audio': bot.send_audio(user_id, f)
+                else: bot.send_video(user_id, f, caption="تم التحميل بواسطة iShop")
+            bot.delete_message(user_id, msg.message_id)
+            os.remove(path)
+        except Exception as e:
+            bot.send_message(user_id, f"فشل الرفع: {e}")
+            if os.path.exists(path): os.remove(path)
+
+bot.infinity_polling()
