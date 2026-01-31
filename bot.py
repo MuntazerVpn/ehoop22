@@ -1,112 +1,140 @@
+import os
+import re
+import glob
+import shutil
+import subprocess
+from pathlib import Path
+
 import telebot
 from telebot import types
-import subprocess
-import os
-import glob
 
 # =========================
-# 🔑 توكن البوت الجديد (تم التحديث)
+# 🔑 تم وضع توكن بوتك هنا
 # =========================
 BOT_TOKEN = "8516502699:AAEL92ZiIhErNZODRHDPlfiF1SfbpnJJ-ds"
 bot = telebot.TeleBot(BOT_TOKEN)
 
 user_links = {}
 
+# الصيغ اللي نعرضها للمستخدم
+AUDIO_FORMATS = ["mp3", "m4a", "opus", "wav", "flac"]
+
+def safe_dirname(s: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]+", "_", s)
+
+def run_cmd(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
 # =========================
-# 🔥 وظيفة التحميل المحسنة
+# 🔥 yt-dlp Download (Audio)
 # =========================
-def ytdlp_download(url, audio, chat_id, msg_id):
+def ytdlp_download_audio(url: str, audio_format: str, chat_id: int, msg_id: int):
+    # إنشاء مجلد مؤقت لكل عملية تحميل لمنع تداخل الملفات
+    workdir = Path(f"job_{safe_dirname(str(chat_id))}_{msg_id}")
+    workdir.mkdir(parents=True, exist_ok=True)
+
     try:
-        bot.edit_message_text("⏳ جاري معالجة الرابط والتحميل...", chat_id, msg_id)
+        bot.edit_message_text("⏳ جاري استخراج وتحويل الصوت...", chat_id, msg_id)
 
-        # توليد اسم ملف فريد لمنع التداخل
-        unique_name = f"dl_{chat_id}_{msg_id}"
-        outtmpl = f"{unique_name}.%(ext)s"
+        # نكتب اسم ثابت داخل مجلد العمل
+        outtmpl = str(workdir / "audio.%(ext)s")
 
-        # إعدادات yt-dlp
-        # --extract-audio تحول أي فيديو أو صوت إلى صيغة صوتية فقط
-        cmd = ["yt-dlp", "--no-playlist", url, "-o", outtmpl]
+        cmd = [
+            "yt-dlp",
+            "--no-playlist",
+            "-x",
+            "--audio-format", audio_format,
+            "--audio-quality", "0",
+            "-o", outtmpl,
+            url,
+        ]
 
-        if audio:
-            # تحويل أي مصدر (Opus, Vorbis, AAC) إلى MP3 حصراً
-            cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
-        else:
-            # تحميل فيديو بصيغة MP4
-            cmd += ["-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"]
-
-        result = subprocess.run(cmd, capture_output=True, text=True)
-
+        result = run_cmd(cmd)
         if result.returncode != 0:
-            bot.edit_message_text(f"❌ خطأ:\n{result.stderr[-200:]}", chat_id, msg_id)
-            return None
+            error_msg = (result.stderr or result.stdout)[-500:]
+            bot.edit_message_text(f"❌ خطأ أثناء التحميل:\n`{error_msg}`", chat_id, msg_id)
+            return None, workdir
 
-        # البحث عن الملف الناتج (بأي امتداد)
-        files = glob.glob(f"{unique_name}.*")
-        final_file = [f for f in files if not f.endswith(".part")]
-        
-        return final_file[0] if final_file else None
+        # البحث عن الملف الناتج
+        files = [p for p in workdir.glob("audio.*") if not str(p).endswith(".part")]
+        if not files:
+            bot.edit_message_text("❌ لم يتم العثور على الملف الناتج", chat_id, msg_id)
+            return None, workdir
+
+        return str(files[0]), workdir
 
     except Exception as e:
-        bot.edit_message_text(f"❌ فشل: {e}", chat_id, msg_id)
-        return None
+        bot.edit_message_text(f"❌ فشل التحميل: {e}", chat_id, msg_id)
+        return None, workdir
+
+def cleanup_dir(workdir: Path):
+    try:
+        shutil.rmtree(workdir, ignore_errors=True)
+    except:
+        pass
 
 # =========================
-# 🤖 أوامر البوت
+# 🤖 Bot Commands
 # =========================
 @bot.message_handler(commands=["start"])
 def start(m):
     bot.reply_to(
         m,
-        "👋 أهلاً بك! أرسل رابط الفيديو (YouTube, TikTok, Instagram...)\n"
-        "وسأقوم بتحويله لك إلى فيديو أو ملف صوتي MP3 بجودة عالية."
+        "👋 أهلاً بك في بوت تحميل الصوتيات!\n\n"
+        "أرسل رابط (يوتيوب، تيك توك، إلخ) وسأقوم بتحويله لأي صيغة تختارها.\n"
+        "⚡ مدعوم بواسطة yt-dlp"
     )
 
 @bot.message_handler(func=lambda m: m.text and m.text.startswith("http"))
 def link(m):
     user_links[m.chat.id] = m.text
-    kb = types.InlineKeyboardMarkup()
-    kb.add(
-        types.InlineKeyboardButton("🎬 فيديو (MP4)", callback_data="v"),
-        types.InlineKeyboardButton("🎵 صوت (MP3)", callback_data="a")
-    )
-    bot.reply_to(m, "اختر الصيغة المطلوبة 👇", reply_markup=kb)
 
-@bot.callback_query_handler(func=lambda c: c.data in ["v", "a"])
-def process(c):
+    # إنشاء أزرار اختيار الصيغة
+    kb = types.InlineKeyboardMarkup(row_width=3)
+    btns = [types.InlineKeyboardButton(f"🎵 {fmt.upper()}", callback_data=f"a:{fmt}") for fmt in AUDIO_FORMATS]
+    kb.add(*btns)
+
+    bot.reply_to(m, "اختر صيغة الصوت التي تريد تحميلها 👇", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("a:"))
+def process_audio(c):
     chat_id = c.message.chat.id
     url = user_links.get(chat_id)
-
+    
     if not url:
-        bot.answer_callback_query(c.id, "❌ انتهت صلاحية الرابط، أرسله مجدداً.")
+        bot.answer_callback_query(c.id, "⚠️ الرجاء إرسال الرابط مرة أخرى")
         return
 
-    bot.delete_message(chat_id, c.message.message_id)
-    msg = bot.send_message(chat_id, "📡 جاري التحميل من المصدر...")
+    audio_format = c.data.split(":", 1)[1]
 
-    path = ytdlp_download(url, c.data == "a", chat_id, msg.message_id)
+    bot.delete_message(chat_id, c.message.message_id)
+    msg = bot.send_message(chat_id, f"🚀 بدأنا تحويل الرابط إلى {audio_format.upper()}...")
+
+    path, workdir = ytdlp_download_audio(url, audio_format, chat_id, msg.message_id)
 
     if path and os.path.exists(path):
         bot.edit_message_text("📤 جاري الرفع إلى تيليجرام...", chat_id, msg.message_id)
 
         try:
+            # التحقق من الصيغ التي يدعمها مشغل تيليجرام كصوت
+            send_as_audio = audio_format in ["mp3", "m4a", "opus", "wav"]
             with open(path, "rb") as f:
-                if c.data == "a":
-                    bot.send_audio(chat_id, f, caption="✅ تم التحويل بنجاح عبر @YourBot")
+                if send_as_audio:
+                    bot.send_audio(chat_id, f, caption=f"✅ تم التحويل إلى {audio_format.upper()}")
                 else:
-                    bot.send_video(chat_id, f, caption="✅ تم التحميل بنجاح")
+                    bot.send_document(chat_id, f, caption=f"✅ تم التحميل بصيغة {audio_format.upper()}")
             
             bot.delete_message(chat_id, msg.message_id)
         except Exception as e:
-            bot.edit_message_text(f"❌ فشل الرفع: {e}", chat_id, msg.message_id)
-        
-        # تنظيف الملفات بعد الإرسال
-        if os.path.exists(path):
-            os.remove(path)
+            bot.edit_message_text(f"❌ خطأ أثناء الرفع: {e}", chat_id, msg.message_id)
     else:
-        bot.edit_message_text("❌ عذراً، لم أتمكن من تحميل الملف.", chat_id, msg.message_id)
+        # الرسالة تظهر فعلياً داخل ytdlp_download_audio في حال الفشل
+        pass
+
+    cleanup_dir(Path(workdir))
 
 # =========================
-# ▶️ تشغيل البوت
+# ▶️ Run
 # =========================
-print("✅ البوت يعمل الآن...")
+print("✅ البوت يعمل الآن.. بانتظار الروابط 🔥")
 bot.infinity_polling()
