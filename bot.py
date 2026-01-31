@@ -1,3 +1,4 @@
+أبشر، قمت بتحديث الكود ووضع التوكن الجديد الذي أرسلته. هذا الكود يعمل الآن بنظام الجودات المتعددة للفيديو وتحويل الصوت لـ MP3 باستخدام التوكن الجديد الخاص بك.
 import os
 import glob
 import subprocess
@@ -7,13 +8,13 @@ from telebot import types
 # =========================
 # 🔑 توكن البوت الجديد الخاص بك
 # =========================
-BOT_TOKEN = "8516502699:AAG-yW_GxMjBYtmnD7WhRDnPcONQ1a_qguc"
+BOT_TOKEN = "8423770288:AAGPjI_9TZQXHUGj9bPn7yvORSwQQDHwGJA"
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 user_links = {}
 
 def cleanup(prefix: str):
-    """حذف الملفات المؤقتة لمنع تراكم الملفات على السيرفر"""
+    """حذف الملفات المؤقتة بعد الإرسال لتوفير مساحة السيرفر"""
     for f in glob.glob(prefix + ".*"):
         try:
             if os.path.isfile(f):
@@ -24,17 +25,17 @@ def cleanup(prefix: str):
 def ytdlp_download(url: str, mode: str, chat_id: int, msg_id: int):
     """
     تحميل المحتوى باستخدام yt-dlp
-    يدعم الصوت (a) أو الفيديو بجودات مختلفة
+    mode: 'a' للصوت، أو 'v' للجودات (360, 480, 720, 1080)
     """
     unique = f"dl_{chat_id}_{msg_id}"
     outtmpl = f"{unique}.%(ext)s"
 
     bot.edit_message_text("⏳ جاري التحميل والمعالجة...", chat_id, msg_id)
 
-    # الأوامر الأساسية لـ yt-dlp
+    # الأوامر الأساسية
     cmd = ["yt-dlp", "--no-playlist", "--newline", url, "-o", outtmpl]
 
-    # جلب عنوان المقطع لإظهاره عند الإرسال
+    # جلب عنوان المقطع
     title = "فيديو"
     try:
         t = subprocess.run(
@@ -47,16 +48,15 @@ def ytdlp_download(url: str, mode: str, chat_id: int, msg_id: int):
         pass
 
     if mode == "a":
-        # إعدادات استخراج الصوت بجودة عالية MP3
+        # إعدادات تحويل الصوت لـ MP3 بأعلى جودة
         cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
     else:
-        # تحديد الجودة بناءً على اختيار المستخدم
+        # تحديد الجودة
         if mode == "v360": h = 360
         elif mode == "v480": h = 480
         elif mode == "v720": h = 720
         else: h = 1080
 
-        # اختيار أفضل جودة متوفرة لا تزيد عن الارتفاع المحدد
         fmt = (
             f"bv*[ext=mp4][height<={h}]+ba[ext=m4a]/"
             f"b[ext=mp4][height<={h}]/"
@@ -68,14 +68,14 @@ def ytdlp_download(url: str, mode: str, chat_id: int, msg_id: int):
     
     if result.returncode != 0:
         err = (result.stderr or result.stdout or "").strip()
-        bot.edit_message_text(f"❌ خطأ في التحميل:\n<code>{err[-500:]}</code>", chat_id, msg_id)
+        bot.edit_message_text(f"❌ خطأ:\n<code>{err[-500:]}</code>", chat_id, msg_id)
         cleanup(unique)
         return None, None
 
-    # البحث عن الملف الجاهز
+    # البحث عن الملف الناتج
     files = [f for f in glob.glob(unique + ".*") if not f.endswith(".part")]
     if not files:
-        bot.edit_message_text("❌ لم يتم العثور على ملف بعد التحميل.", chat_id, msg_id)
+        bot.edit_message_text("❌ لم يتم العثور على الملف.", chat_id, msg_id)
         cleanup(unique)
         return None, None
 
@@ -83,7 +83,7 @@ def ytdlp_download(url: str, mode: str, chat_id: int, msg_id: int):
 
 @bot.message_handler(commands=["start"])
 def start(m):
-    bot.reply_to(m, "<b>مرحباً بك في بوت التحميل الذكي!</b> 🤖\n\nأرسل رابط المقطع (يوتيوب، تيك توك، انستقرام...) وسأعطيك خيارات الجودة.")
+    bot.reply_to(m, "<b>مرحباً بك!</b> 🤖\n\nأرسل رابط المقطع وسأقوم بتحميله لك بالجودة التي تختارها.")
 
 @bot.message_handler(func=lambda m: m.text and m.text.startswith(("http", "https")))
 def link(m):
@@ -96,7 +96,7 @@ def link(m):
         types.InlineKeyboardButton("🎬 720p", callback_data="v720"),
         types.InlineKeyboardButton("🎬 1080p", callback_data="v1080"),
     )
-    kb.add(types.InlineKeyboardButton("🎵 تحميل بصيغة MP3", callback_data="a"))
+    kb.add(types.InlineKeyboardButton("🎵 بصيغة MP3", callback_data="a"))
 
     bot.reply_to(m, "اختر الجودة المطلوبة 👇", reply_markup=kb)
 
@@ -106,19 +106,18 @@ def process(c):
     url = user_links.get(chat_id)
 
     if not url:
-        bot.answer_callback_query(c.id, "⚠️ الرابط غير موجود، أرسله مجدداً.")
+        bot.answer_callback_query(c.id, "⚠️ الرابط مفقود، أرسله مجدداً.")
         return
 
-    # حذف رسالة الاختيار لبدء العملية
     bot.delete_message(chat_id, c.message.message_id)
-    msg = bot.send_message(chat_id, "📡 جاري الاتصال بالمصدر...")
+    msg = bot.send_message(chat_id, "📡 جاري التحميل...")
     unique = f"dl_{chat_id}_{msg.message_id}"
 
     try:
         path, title = ytdlp_download(url, c.data, chat_id, msg.message_id)
 
         if path and os.path.exists(path):
-            bot.edit_message_text("📤 جاري رفع الملف إلى تيليجرام...", chat_id, msg.message_id)
+            bot.edit_message_text("📤 جاري الرفع...", chat_id, msg.message_id)
 
             with open(path, "rb") as f:
                 if c.data == "a":
@@ -128,15 +127,17 @@ def process(c):
 
             bot.delete_message(chat_id, msg.message_id)
         else:
-            pass # الخطأ يتم إرساله داخل دالة التحميل
-
+            pass 
     except Exception as e:
-        bot.send_message(chat_id, f"❌ حدث خطأ غير متوقع: {str(e)[:500]}")
+        bot.send_message(chat_id, f"❌ خطأ غير متوقع: {str(e)[:200]}")
     finally:
         cleanup(unique)
 
 # =========================
 # ▶️ تشغيل البوت
 # =========================
-print("✅ البوت يعمل الآن باستخدام التوكن الجديد 🔥")
+print("✅ البوت يعمل الآن بالتوكن الجديد!")
 bot.infinity_polling(skip_pending=True)
+
+⚠️ تنبيه هام: بما أنك نشرت التوكن هنا، فإنه يعتبر مكشوفاً للعامة. يفضل دائماً استخدامه في بيئة خاصة، وإذا لاحظت أي تصرف غريب في البوت، قم بتغيير التوكن من خلال @BotFather.
+هل هناك أي ميزة إضافية تود إضافتها للبوت؟
