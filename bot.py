@@ -7,7 +7,7 @@ import json
 import datetime
 
 # ==========================================
-# ⚙️ الإعدادات
+# ⚙️ الإعدادات (iShop Bot)
 # ==========================================
 BOT_TOKEN = '8516502699:AAG-yW_GxMjBYtmnD7WhRDnPcONQ1a_qguc'
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -45,48 +45,33 @@ def check_subscription(user_id):
     except: return True 
 
 # ==========================================
-# 📥 دوال التحميل (بوضع الشاشة الذكية TV)
+# 📥 دوال التحميل (تحديث التجاوز 2026)
 # ==========================================
-def check_qualities(url):
-    try:
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'geo_bypass': True,
-            # ✅ استخدام هوية مشغل التلفاز
-            'user_agent': 'Mozilla/5.0 (Linux; Adroid 11; Sony Bravia 4K TV Build/RP1A.200720.011) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.104 Safari/537.36',
-            'extractor_args': {'youtube': {'player_client': ['tv', 'web_embedded']}},
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if 'youtube' in url or 'youtu.be' in url:
-                formats = info.get('formats', [])
-                resolutions = set()
-                for f in formats:
-                    if f.get('height'): resolutions.add(f.get('height'))
-                return sorted(list(resolutions), reverse=True), info.get('title', 'Video')
-            return ['Best'], info.get('title', 'Video')
-    except Exception as e:
-        return [], str(e)
-
 def download_content(url, quality, chat_id, msg_id):
     try:
-        # الإعدادات الذهبية لمحاكاة التلفاز ودمج الجودة
         ydl_opts = {
             'outtmpl': '%(title)s.%(ext)s', 
             'quiet': True, 
             'no_warnings': True,
             'nocheckcertificate': True,
-            # ✅ محاكاة Sony Bravia 4K TV
-            'user_agent': 'Mozilla/5.0 (Linux; Adroid 11; Sony Bravia 4K TV Build/RP1A.200720.011) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.104 Safari/537.36',
-            'extractor_args': {'youtube': {'player_client': ['tv', 'web_embedded']}},
+            # ✅ استخدام User-Agent لمتصفح Chrome حديث جداً (نظام ويندوز)
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+            # ✅ إضافة رؤوس طلبات لمحاكاة تصفح حقيقي
+            'http_headers': {
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Sec-Fetch-Mode': 'navigate',
+            },
+            # ✅ استخدام مشغل الويب المحمول (mweb) لتجاوز قيود DRM
+            'extractor_args': {'youtube': {'player_client': ['mweb', 'web_embedded']}},
             'format': 'bestvideo+bestaudio/best', 
             'merge_output_format': 'mp4',
+            'ignoreerrors': False,
         }
         
         if quality == 'audio':
             ydl_opts.update({'format': 'bestaudio/best', 'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3'}]})
-            bot.edit_message_text("جاري استخراج الصوت (TV Mode)... 🎵", chat_id, msg_id)
+            bot.edit_message_text("جاري استخراج الصوت... 🎵", chat_id, msg_id)
         else:
             bot.edit_message_text(f"جاري جلب الفيديو بجودة {quality}p... 🚀", chat_id, msg_id)
 
@@ -101,63 +86,18 @@ def download_content(url, quality, chat_id, msg_id):
                 elif os.path.exists(base + '.mkv'): f = base + '.mkv'
 
             return f, info.get('title', 'media')
+            
     except Exception as e:
-        bot.edit_message_text(f"❌ خطأ يوتيوب: {str(e)[:100]}", chat_id, msg_id)
+        err = str(e)
+        # ✅ رسائل خطأ واضحة للمستخدم
+        if "403" in err:
+            msg = "❌ السيرفر محظور حالياً من يوتيوب. يرجى المحاولة لاحقاً."
+        elif "DRM" in err:
+            msg = "⚠️ هذا الفيديو محمي ولا يمكن تحميله برمجياً."
+        else:
+            msg = f"❌ فشل: {err[:50]}..."
+        
+        bot.edit_message_text(msg, chat_id, msg_id)
         return None, None
 
-# ==========================================
-# 🤖 المعالجات
-# ==========================================
-@bot.message_handler(commands=['start'])
-def welcome(message):
-    bot.reply_to(message, "أهلاً بك! 👋\nأرسل رابط الفيديو للتحميل (تم تفعيل وضع TV Bypass).")
-
-@bot.message_handler(func=lambda m: m.text.startswith('http'))
-def get_link(m):
-    user_id = m.from_user.id
-    if not check_subscription(user_id):
-        bot.reply_to(m, "⚠️ اشترك في القناة: @eshop_2")
-        return
-
-    wait = bot.reply_to(m, "جاري الفحص... 🔎")
-    res, title_or_error = check_qualities(m.text)
-    
-    if not res: 
-        bot.edit_message_text(f"❌ فشل: {title_or_error[:100]}", m.chat.id, wait.message_id)
-        return
-    
-    user_urls[m.chat.id] = m.text
-    markup = types.InlineKeyboardMarkup()
-    if 'Best' in res:
-        markup.add(types.InlineKeyboardButton("تحميل فيديو ✅", callback_data="q|Best"))
-    else:
-        btns = [types.InlineKeyboardButton(f"{r}p", callback_data=f"q|{r}") for r in res[:6]]
-        markup.add(*btns)
-    
-    markup.add(types.InlineKeyboardButton("صوت (MP3) 🎵", callback_data="q|audio"))
-    bot.edit_message_text(f"🎬 {title_or_error}", m.chat.id, wait.message_id, reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith('q|'))
-def process(c):
-    user_id = c.message.chat.id
-    url = user_urls.get(user_id)
-    qual = c.data.split('|')[1]
-    
-    bot.delete_message(user_id, c.message.message_id)
-    msg = bot.send_message(user_id, "جاري البدء... ⏳")
-    
-    path, title = download_content(url, qual, user_id, msg.message_id)
-    
-    if path and os.path.exists(path):
-        try:
-            bot.edit_message_text("جاري الرفع... 📤", user_id, msg.message_id)
-            with open(path, 'rb') as f:
-                if qual == 'audio': bot.send_audio(user_id, f, title=title)
-                else: bot.send_video(user_id, f, caption=title)
-            bot.delete_message(user_id, msg.message_id)
-            os.remove(path)
-        except Exception as e:
-            bot.send_message(user_id, f"فشل الرفع: {e}")
-            if os.path.exists(path): os.remove(path)
-
-bot.infinity_polling()
+# (استخدم بقية المعالجات من الكود الأصلي)
