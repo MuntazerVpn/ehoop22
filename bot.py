@@ -2,8 +2,12 @@ import telebot
 from telebot import types
 import subprocess
 import os
+import glob
 
-BOT_TOKEN = "8516502699:AAG-yW_GxMjBYtmnD7WhRDnPcONQ1a_qguc"
+# =========================
+# 🔑 توكن البوت
+# =========================
+BOT_TOKEN = "8516502699:AAEL92ZiIhErNZODRHDPlfiF1SfbpnJJ-ds"
 bot = telebot.TeleBot(BOT_TOKEN)
 
 user_links = {}
@@ -15,25 +19,39 @@ def ytdlp_download(url, audio, chat_id, msg_id):
     try:
         bot.edit_message_text("⏳ جاري التحميل عبر yt-dlp...", chat_id, msg_id)
 
-        ext = "mp3" if audio else "mp4"
-        file = f"download_{chat_id}.{ext}"
+        base = f"download_{chat_id}"
+        outtmpl = base + ".%(ext)s"
 
-        cmd = ["yt-dlp", url, "-o", file]
+        cmd = ["yt-dlp", "--no-playlist", url, "-o", outtmpl]
 
         if audio:
-            cmd += ["-x", "--audio-format", "mp3"]
+            cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
         else:
             cmd += ["-f", "mp4"]
 
-        subprocess.run(cmd, check=True)
-        return file
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            bot.edit_message_text(
+                "❌ خطأ أثناء التحميل:\n"
+                f"{result.stderr[-1500:]}",
+                chat_id, msg_id
+            )
+            return None
+
+        if audio:
+            files = glob.glob(base + ".mp3")
+        else:
+            files = [f for f in glob.glob(base + ".*") if not f.endswith(".part")]
+
+        return files[0] if files else None
 
     except Exception as e:
         bot.edit_message_text(f"❌ فشل التحميل: {e}", chat_id, msg_id)
         return None
 
 # =========================
-# 🤖 أوامر
+# 🤖 أوامر البوت
 # =========================
 @bot.message_handler(commands=["start"])
 def start(m):
@@ -41,10 +59,10 @@ def start(m):
         m,
         "👋 أرسل الرابط\n"
         "🎬 فيديو أو 🎵 MP3\n"
-        "⚡ يعمل على Railway بدون مشاكل"
+        "⚡ يعمل عبر yt-dlp"
     )
 
-@bot.message_handler(func=lambda m: m.text.startswith("http"))
+@bot.message_handler(func=lambda m: m.text and m.text.startswith("http"))
 def link(m):
     user_links[m.chat.id] = m.text
 
@@ -81,7 +99,7 @@ def process(c):
         bot.edit_message_text("❌ فشل التحميل", chat_id, msg.message_id)
 
 # =========================
-# ▶️ تشغيل
+# ▶️ تشغيل البوت
 # =========================
-print("Bot running with yt-dlp only 🔥")
+print("Bot running with yt-dlp 🔥")
 bot.infinity_polling()
