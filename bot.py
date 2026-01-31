@@ -189,7 +189,6 @@ def fetch_info(url: str, fmt: str, domain: str) -> dict | None:
     try:
         cmd = ["yt-dlp"] + common_ytdlp_args(domain) + ["-f", fmt, "-J", url]
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-
         if p.returncode != 0 or not p.stdout.strip():
             return None
 
@@ -245,31 +244,35 @@ def stop_process(proc: subprocess.Popen):
 
 
 # =========================
-# Format selection
+# Format selection: ONLY 720 / 480 / audio
+# إذا غير متوفرين => ينزل أي جودة تلقائيًا
 # =========================
 def build_format(domain: str, mode: str) -> str:
-    """
-    mode:
-      - ig_video
-      - v_high / v_low
-      - v_audio
-    """
     # Instagram: فيديو فقط
     if mode == "ig_video":
-        # أفضل اختيار عام
         return "best[ext=mp4][vcodec!=none][acodec!=none]/best"
 
-    # صوت فقط
+    # Audio
     if mode == "v_audio":
         return "bestaudio[ext=m4a]/bestaudio/best"
 
-    # فيديو عالي/أقل
-    # نفضّل mp4 progressive (فيديو+صوت بملف واحد) لتجنب "صوت فقط"
-    if mode == "v_high":
-        return "best[ext=mp4][vcodec!=none][acodec!=none]/best[ext=mp4]/best"
-    else:  # v_low
-        # أقل: نحد الارتفاع (360) إن توفر
-        return "best[height<=360][ext=mp4][vcodec!=none][acodec!=none]/best[height<=360][ext=mp4]/best"
+    # Video 720
+    if mode == "v_720":
+        return (
+            "best[height<=720][ext=mp4][vcodec!=none][acodec!=none]/"
+            "best[ext=mp4][vcodec!=none][acodec!=none]/"
+            "best"
+        )
+
+    # Video 480
+    if mode == "v_480":
+        return (
+            "best[height<=480][ext=mp4][vcodec!=none][acodec!=none]/"
+            "best[ext=mp4][vcodec!=none][acodec!=none]/"
+            "best"
+        )
+
+    return "best"
 
 
 # =========================
@@ -284,7 +287,7 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
 
     fmt = build_format(domain, mode)
 
-    # معلومات قبل التحميل (الميزة رجعت ✅)
+    # معلومات قبل التحميل ✅
     info = fetch_info(url, fmt, domain) or {}
     title = info.get("title", "بدون عنوان")
     channel = info.get("channel", "غير معروف")
@@ -311,10 +314,8 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
         if has_ffmpeg():
             extra_args += ["--merge-output-format", "mp4", "--remux-video", "mp4"]
         else:
-            # بدون ffmpeg نحاول نفضّل mp4
             extra_args += ["--format-sort", "ext:mp4"]
     else:
-        # صوت فقط: استخراج m4a
         if has_ffmpeg():
             extra_args += ["-x", "--audio-format", "m4a", "--audio-quality", "0"]
 
@@ -496,7 +497,7 @@ def start(m):
     bot.reply_to(
         m,
         "👋 <b>أرسل الرابط</b>\n\n"
-        "🔹 يوتيوب/تيك توك: يسألك <b>عالي</b> أو <b>أقل</b> أو <b>صوت</b>\n"
+        "🔹 يوتيوب/تيك توك: <b>720p</b> أو <b>480p</b> أو <b>صوت</b>\n"
         "🔹 إنستغرام: فيديو فقط\n\n"
         "✅ يعرض معلومات قبل التحميل + نسبة التحميل %\n"
         "🛑 زر إلغاء أثناء التحميل\n\n"
@@ -517,8 +518,8 @@ def link(m):
         kb.add(types.InlineKeyboardButton("📸 تحميل فيديو (إنستغرام)", callback_data="ig_video"))
     else:
         kb.add(
-            types.InlineKeyboardButton("🎬 فيديو (عالي)", callback_data="v_high"),
-            types.InlineKeyboardButton("📉 فيديو (أقل)", callback_data="v_low"),
+            types.InlineKeyboardButton("🎬 فيديو 720p", callback_data="v_720"),
+            types.InlineKeyboardButton("🎬 فيديو 480p", callback_data="v_480"),
             types.InlineKeyboardButton("🎵 صوت فقط", callback_data="v_audio"),
         )
 
@@ -560,7 +561,7 @@ def cancel_download(c):
         pass
 
 
-@bot.callback_query_handler(func=lambda c: c.data in ["ig_video", "v_high", "v_low", "v_audio"])
+@bot.callback_query_handler(func=lambda c: c.data in ["ig_video", "v_720", "v_480", "v_audio"])
 def process_choice(c):
     chat_id = c.message.chat.id
     url = user_links.get(chat_id)
@@ -576,7 +577,7 @@ def process_choice(c):
         bot.edit_message_text("❌ أرسل الرابط مرة ثانية.", chat_id, msg.message_id)
         return
 
-    mode = c.data  # ig_video / v_high / v_low / v_audio
+    mode = c.data  # ig_video / v_720 / v_480 / v_audio
     t = threading.Thread(target=handle_download, args=(chat_id, url, mode, msg.message_id), daemon=True)
     t.start()
 
