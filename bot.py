@@ -1,202 +1,119 @@
-import os
-import glob
-import subprocess
 import telebot
 from telebot import types
+import subprocess
+import os
 
-# ✅ تم وضع التوكن مباشرة هنا
+# 🔐 توكن البوت (لأغراض تعليمية فقط)
 BOT_TOKEN = "8423770288:AAGPjI_9TZQXHUGj9bPn7yvORSwQQDHwGJA"
 
-if not BOT_TOKEN:
-    raise RuntimeError("❌ BOT_TOKEN غير موجود. أضفه في Railway Variables.")
+bot = telebot.TeleBot(BOT_TOKEN)
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 user_links = {}
 
-# ✅ مسار ffmpeg في Railway (Linux)
-FFMPEG_LOCATION = os.getenv("FFMPEG_LOCATION", "/usr/bin")
-
-
-def cleanup(prefix: str):
-    """حذف الملفات المؤقتة بعد الإرسال"""
-    for f in glob.glob(prefix + ".*"):
-        try:
-            if os.path.isfile(f):
-                os.remove(f)
-        except:
-            pass
-
-
-def ytdlp_download(url: str, mode: str, chat_id: int, msg_id: int):
-    """
-    mode:
-      a        => mp3
-      v360     => mp4 <=360p
-      v480     => mp4 <=480p
-      v720     => mp4 <=720p
-      v1080    => mp4 <=1080p
-    """
-    unique = f"dl_{chat_id}_{msg_id}"
-    outtmpl = f"{unique}.%(ext)s"
-
+# =========================
+# 🔥 yt-dlp تحميل
+# =========================
+def ytdlp_download(url, mode, chat_id, msg_id):
     try:
-        bot.edit_message_text("⏳ جاري التحميل من المصدر...", chat_id, msg_id)
-    except:
-        pass
+        bot.edit_message_text("⏳ جاري التحميل...", chat_id, msg_id)
 
-    # ✅ أضفنا ffmpeg-location لحل مشكلة mp3 (لو ffmpeg مثبت)
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "--newline",
-        "--ffmpeg-location", FFMPEG_LOCATION,
-        url,
-        "-o", outtmpl
-    ]
+        out_template = f"download_{chat_id}.%(ext)s"
 
-    # محاولة جلب العنوان
-    title = None
-    try:
-        t = subprocess.run(
-            ["yt-dlp", "--no-playlist", "--print", "%(title)s", url],
-            capture_output=True, text=True
-        )
-        if t.returncode == 0:
-            title = (t.stdout or "").strip()[:120]
-    except:
-        pass
+        if mode == "audio":
+            # 🎵 صوت فقط بدون تحويل
+            cmd = [
+                "yt-dlp",
+                "-f", "bestaudio/best",
+                "--no-playlist",
+                "-o", out_template,
+                url
+            ]
 
-    if mode == "a":
-        # ✅ MP3 يحتاج ffmpeg/ffprobe
-        cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
-    else:
-        if mode == "v360":
-            h = 360
-        elif mode == "v480":
-            h = 480
-        elif mode == "v720":
-            h = 720
-        else:
-            h = 1080
+        elif mode == "video_high":
+            # 🎬 فيديو جودة عالية
+            cmd = [
+                "yt-dlp",
+                "-f", "mp4/bestvideo+bestaudio/best",
+                "--no-playlist",
+                "-o", out_template,
+                url
+            ]
 
-        fmt = (
-            f"bv*[ext=mp4][height<={h}]+ba[ext=m4a]/"
-            f"b[ext=mp4][height<={h}]/"
-            "b[ext=mp4]/best"
-        )
-        cmd += ["-f", fmt, "--merge-output-format", "mp4"]
+        else:  # video_low
+            # 📉 فيديو جودة منخفضة جدًا
+            cmd = [
+                "yt-dlp",
+                "-f", "mp4[height<=360]/best",
+                "--no-playlist",
+                "-o", out_template,
+                url
+            ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+        subprocess.run(cmd, check=True)
 
-    if result.returncode != 0:
-        err = (result.stderr or result.stdout or "").strip()
+        for f in os.listdir("."):
+            if f.startswith(f"download_{chat_id}."):
+                return f
 
-        # رسالة أوضح لو ffmpeg مفقود
-        low = err.lower()
-        if "ffprobe and ffmpeg not found" in low or "ffmpeg not found" in low or "ffprobe not found" in low:
-            msg = (
-                "❌ ffmpeg/ffprobe غير موجود على السيرفر.\n"
-                "✅ على Railway تأكد أن nixpacks.toml يحتوي ffmpeg:\n"
-                "<code>nixPkgs = [\"python3\", \"ffmpeg\"]</code>"
-            )
-        else:
-            msg = f"❌ خطأ في التحميل:\n<code>{err[-800:]}</code>"
+        return None
 
-        try:
-            bot.edit_message_text(msg, chat_id, msg_id)
-        except:
-            pass
+    except Exception as e:
+        bot.edit_message_text(f"❌ خطأ: {e}", chat_id, msg_id)
+        return None
 
-        cleanup(unique)
-        return None, None
-
-    files = [f for f in glob.glob(unique + ".*") if not f.endswith(".part")]
-    if not files:
-        try:
-            bot.edit_message_text("❌ لم يتم العثور على ملف ناتج.", chat_id, msg_id)
-        except:
-            pass
-        cleanup(unique)
-        return None, None
-
-    files.sort(key=lambda p: os.path.getsize(p), reverse=True)
-    return files[0], title
-
-
+# =========================
+# 🤖 أوامر
+# =========================
 @bot.message_handler(commands=["start"])
 def start(m):
-    bot.reply_to(m, "👋 أرسل رابط الفيديو (يوتيوب، تيك توك، انستقرام)، ثم اختر الجودة.")
-
-
-@bot.message_handler(func=lambda m: m.text and m.text.startswith(("http://", "https://")))
-def link(m):
-    user_links[m.chat.id] = m.text.strip()
-
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("🎬 360p", callback_data="v360"),
-        types.InlineKeyboardButton("🎬 480p", callback_data="v480"),
-        types.InlineKeyboardButton("🎬 720p", callback_data="v720"),
-        types.InlineKeyboardButton("🎬 1080p", callback_data="v1080"),
+    bot.reply_to(
+        m,
+        "👋 أرسل الرابط\n\n"
+        "🎬 فيديو جودة عالية\n"
+        "📉 فيديو جودة منخفضة جدًا\n"
+        "🎵 صوت فقط (بدون مقطع)\n\n"
+        "⚡ بوت تعليمي باستخدام yt-dlp"
     )
-    kb.add(types.InlineKeyboardButton("🎵 تحويل صوت (MP3)", callback_data="a"))
 
-    bot.reply_to(m, "اختر الجودة المطلوبة 👇", reply_markup=kb)
+@bot.message_handler(func=lambda m: m.text and m.text.startswith("http"))
+def link(m):
+    user_links[m.chat.id] = m.text
 
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("🎬 فيديو جودة عالية", callback_data="video_high"),
+        types.InlineKeyboardButton("📉 فيديو جودة منخفضة جدًا", callback_data="video_low"),
+        types.InlineKeyboardButton("🎵 صوت فقط", callback_data="audio")
+    )
 
-@bot.callback_query_handler(func=lambda c: c.data in ("v360", "v480", "v720", "v1080", "a"))
+    bot.reply_to(m, "اختر الصيغة 👇", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data in ["video_high", "video_low", "audio"])
 def process(c):
     chat_id = c.message.chat.id
     url = user_links.get(chat_id)
 
-    if not url:
-        bot.answer_callback_query(c.id, "❌ الرابط قديم، أرسله مرة أخرى.")
-        return
+    bot.delete_message(chat_id, c.message.message_id)
+    msg = bot.send_message(chat_id, "⏳ بدء التحميل...")
 
-    try:
-        bot.delete_message(chat_id, c.message.message_id)
-    except:
-        pass
+    path = ytdlp_download(url, c.data, chat_id, msg.message_id)
 
-    msg = bot.send_message(chat_id, "📡 جاري بدء العملية...")
-    unique = f"dl_{chat_id}_{msg.message_id}"
+    if path and os.path.exists(path):
+        bot.edit_message_text("📤 رفع إلى تيليجرام...", chat_id, msg.message_id)
 
-    try:
-        path, title = ytdlp_download(url, c.data, chat_id, msg.message_id)
+        with open(path, "rb") as f:
+            if c.data == "audio":
+                bot.send_audio(chat_id, f)
+            else:
+                bot.send_video(chat_id, f)
 
-        if path and os.path.exists(path):
-            bot.edit_message_text("📤 جاري الرفع إلى تيليجرام...", chat_id, msg.message_id)
+        bot.delete_message(chat_id, msg.message_id)
+        os.remove(path)
+    else:
+        bot.edit_message_text("❌ فشل التحميل", chat_id, msg.message_id)
 
-            with open(path, "rb") as f:
-                caption_text = title if title else "تم التحميل بواسطة البوت"
-
-                if c.data == "a":
-                    bot.send_audio(
-                        chat_id,
-                        f,
-                        title=(title[:50] if title else "Audio"),
-                        caption="✅ تم التحويل لـ MP3"
-                    )
-                else:
-                    bot.send_video(
-                        chat_id,
-                        f,
-                        caption=f"🎥 {caption_text}\n✅ الجودة: {c.data.replace('v','')}"
-                    )
-
-            try:
-                bot.delete_message(chat_id, msg.message_id)
-            except:
-                pass
-
-    except Exception as e:
-        try:
-            bot.edit_message_text(f"❌ خطأ غير متوقع: <code>{str(e)[:800]}</code>", chat_id, msg.message_id)
-        except:
-            pass
-    finally:
-        cleanup(unique)
-
-
-print("✅ البوت يعمل الآن (Bot is running)...")
-bot.infinity_polling(skip_pending=True)
+# =========================
+# ▶️ تشغيل
+# =========================
+print("Bot running (educational token) 🚀")
+bot.infinity_polling()
