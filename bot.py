@@ -7,7 +7,7 @@ import json
 import datetime
 
 # ==========================================
-# ⚙️ الإعدادات (التوكن الجديد الخاص بك)
+# ⚙️ الإعدادات
 # ==========================================
 BOT_TOKEN = '8516502699:AAG-yW_GxMjBYtmnD7WhRDnPcONQ1a_qguc'
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -35,9 +35,6 @@ def init_user(user_id, db):
     if str_id not in db:
         db[str_id] = {"joined_date": str(datetime.datetime.now()), "last_use": 0, "data_usage": 0, "usage_date": today}
         return True, db
-    if db[str_id].get("usage_date") != today:
-        db[str_id]["data_usage"] = 0
-        db[str_id]["usage_date"] = today
     return False, db
 
 def check_subscription(user_id):
@@ -48,7 +45,7 @@ def check_subscription(user_id):
     except: return True 
 
 # ==========================================
-# 📥 دوال التحميل المحسنة
+# 📥 دوال التحميل (بوضع الشاشة الذكية TV)
 # ==========================================
 def check_qualities(url):
     try:
@@ -56,7 +53,9 @@ def check_qualities(url):
             'quiet': True,
             'no_warnings': True,
             'geo_bypass': True,
-            'extractor_args': {'youtube': {'player_client': ['ios', 'android']}},
+            # ✅ استخدام هوية مشغل التلفاز
+            'user_agent': 'Mozilla/5.0 (Linux; Adroid 11; Sony Bravia 4K TV Build/RP1A.200720.011) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.104 Safari/537.36',
+            'extractor_args': {'youtube': {'player_client': ['tv', 'web_embedded']}},
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -72,21 +71,24 @@ def check_qualities(url):
 
 def download_content(url, quality, chat_id, msg_id):
     try:
-        # إعدادات تضمن دمج الصوت والصورة بجودة عالية
+        # الإعدادات الذهبية لمحاكاة التلفاز ودمج الجودة
         ydl_opts = {
             'outtmpl': '%(title)s.%(ext)s', 
             'quiet': True, 
             'no_warnings': True,
-            'extractor_args': {'youtube': {'player_client': ['android', 'ios']}},
+            'nocheckcertificate': True,
+            # ✅ محاكاة Sony Bravia 4K TV
+            'user_agent': 'Mozilla/5.0 (Linux; Adroid 11; Sony Bravia 4K TV Build/RP1A.200720.011) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.104 Safari/537.36',
+            'extractor_args': {'youtube': {'player_client': ['tv', 'web_embedded']}},
             'format': 'bestvideo+bestaudio/best', 
             'merge_output_format': 'mp4',
         }
         
         if quality == 'audio':
             ydl_opts.update({'format': 'bestaudio/best', 'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3'}]})
-            bot.edit_message_text("جاري تحميل الصوت... 🎵", chat_id, msg_id)
+            bot.edit_message_text("جاري استخراج الصوت (TV Mode)... 🎵", chat_id, msg_id)
         else:
-            bot.edit_message_text(f"جاري تحضير الفيديو... 🚀", chat_id, msg_id)
+            bot.edit_message_text(f"جاري جلب الفيديو بجودة {quality}p... 🚀", chat_id, msg_id)
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -100,7 +102,7 @@ def download_content(url, quality, chat_id, msg_id):
 
             return f, info.get('title', 'media')
     except Exception as e:
-        bot.edit_message_text(f"❌ حدث خطأ: {str(e)[:100]}", chat_id, msg_id)
+        bot.edit_message_text(f"❌ خطأ يوتيوب: {str(e)[:100]}", chat_id, msg_id)
         return None, None
 
 # ==========================================
@@ -108,24 +110,20 @@ def download_content(url, quality, chat_id, msg_id):
 # ==========================================
 @bot.message_handler(commands=['start'])
 def welcome(message):
-    user_id = message.from_user.id
-    db = load_db()
-    init_user(user_id, db)
-    save_db(db)
-    bot.reply_to(message, "أهلاً بك! 👋\nأرسل رابط فيديو من يوتيوب، تيك توك، أو انستقرام وسأقوم بتحميله لك.")
+    bot.reply_to(message, "أهلاً بك! 👋\nأرسل رابط الفيديو للتحميل (تم تفعيل وضع TV Bypass).")
 
 @bot.message_handler(func=lambda m: m.text.startswith('http'))
 def get_link(m):
     user_id = m.from_user.id
     if not check_subscription(user_id):
-        bot.reply_to(m, "⚠️ عذراً، يجب عليك الاشتراك في القناة أولاً: @eshop_2")
+        bot.reply_to(m, "⚠️ اشترك في القناة: @eshop_2")
         return
 
     wait = bot.reply_to(m, "جاري الفحص... 🔎")
     res, title_or_error = check_qualities(m.text)
     
     if not res: 
-        bot.edit_message_text(f"❌ خطأ: الرابط غير مدعوم أو محمي.", m.chat.id, wait.message_id)
+        bot.edit_message_text(f"❌ فشل: {title_or_error[:100]}", m.chat.id, wait.message_id)
         return
     
     user_urls[m.chat.id] = m.text
@@ -133,7 +131,6 @@ def get_link(m):
     if 'Best' in res:
         markup.add(types.InlineKeyboardButton("تحميل فيديو ✅", callback_data="q|Best"))
     else:
-        # عرض أول 6 جودات فقط لعدم ازدحام الأزرار
         btns = [types.InlineKeyboardButton(f"{r}p", callback_data=f"q|{r}") for r in res[:6]]
         markup.add(*btns)
     
@@ -147,13 +144,13 @@ def process(c):
     qual = c.data.split('|')[1]
     
     bot.delete_message(user_id, c.message.message_id)
-    msg = bot.send_message(user_id, "جاري المعالجة... ⏳")
+    msg = bot.send_message(user_id, "جاري البدء... ⏳")
     
     path, title = download_content(url, qual, user_id, msg.message_id)
     
     if path and os.path.exists(path):
         try:
-            bot.edit_message_text("جاري الرفع إلى تيليجرام... 📤", user_id, msg.message_id)
+            bot.edit_message_text("جاري الرفع... 📤", user_id, msg.message_id)
             with open(path, 'rb') as f:
                 if qual == 'audio': bot.send_audio(user_id, f, title=title)
                 else: bot.send_video(user_id, f, caption=title)
