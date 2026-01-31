@@ -1,53 +1,52 @@
-import telebot
-from telebot import types
-import yt_dlp
-import os
-
-# ⚠️ ضع التوكن الخاص بك هنا
-BOT_TOKEN = '8513261810:AAENsuncE8EeW7JBB0fWrrO36uejFoZzTYw'
-bot = telebot.TeleBot(BOT_TOKEN)
-
-# دالة التحميل
-def download_video(url):
+def download_content(url, quality, chat_id, msg_id):
     try:
-        # إعدادات مخصصة لـ Railway (وضع الآيفون)
+        # إعدادات محسنة لتجنب مشاكل الصيغ
         ydl_opts = {
-            'format': 'best[ext=mp4]/best',
-            'outtmpl': '%(title)s.%(ext)s',
-            'quiet': True,
-            'extractor_args': {'youtube': {'player_client': ['ios']}}, # خداع اليوتيوب
+            'outtmpl': '%(title)s.%(ext)s', 
+            'quiet': True, 
+            'no_warnings': True,
+            # هذا السطر مهم جداً لخداع يوتيوب
+            'extractor_args': {'youtube': {'player_client': ['android', 'ios']}},
+            # السماح بتحميل أفضل فيديو وصوت ودمجهم، أو أفضل صيغة متاحة
+            'format': 'bestvideo+bestaudio/best', 
+            'merge_output_format': 'mp4', # دمج الناتج النهائي ليصبح MP4
         }
+        
+        if quality == 'audio':
+            ydl_opts.update({
+                'format': 'bestaudio/best',
+                'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3'}]
+            })
+            text = "جاري تحميل الصوت... 🎵"
+        else:
+            text = f"جاري تحميل الفيديو... 🚀"
+
+        bot.edit_message_text(text, chat_id, msg_id)
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            return ydl.prepare_filename(info), info.get('title', 'Video')
+            f = ydl.prepare_filename(info)
+            
+            # تصحيح اسم الملف في حال تغيرت الصيغة بعد الدمج
+            if quality != 'audio':
+                pre, ext = os.path.splitext(f)
+                if ext != '.mp4':
+                    if os.path.exists(pre + '.mp4'):
+                        f = pre + '.mp4'
+                    elif os.path.exists(pre + '.mkv'): # احتياط
+                        f = pre + '.mkv'
+
+            if quality == 'audio': 
+                f = os.path.splitext(f)[0] + '.mp3'
+                
+            return f, info.get('title', 'media')
+
     except Exception as e:
-        return None, str(e)
-
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    bot.reply_to(message, "أهلاً! أرسل رابط تيك توك، انستقرام، أو يوتيوب وسأقوم بتحميله. 🚀")
-
-@bot.message_handler(func=lambda m: True)
-def handle_message(message):
-    url = message.text
-    if not url.startswith('http'): return
-
-    msg = bot.reply_to(message, "جاري التحميل... ⏳")
-    
-    path, title = download_video(url)
-    
-    if path and os.path.exists(path):
-        try:
-            bot.edit_message_text("جاري الرفع... 📤", message.chat.id, msg.message_id)
-            with open(path, 'rb') as video:
-                bot.send_video(message.chat.id, video, caption=title)
-            os.remove(path)
-            bot.delete_message(message.chat.id, msg.message_id)
-        except Exception as e:
-            bot.edit_message_text(f"حجم الفيديو كبير جداً (أكثر من 50MB) ⚠️\nRailway لا يدعم رفع الملفات الضخمة.", message.chat.id, msg.message_id)
-            os.remove(path)
+        bot.edit_message_text(f"خطأ: {str(e)[:100]}", chat_id, msg_id)
+        return None, None  os.remove(path)
     else:
         bot.edit_message_text(f"فشل التحميل ❌\n{title}", message.chat.id, msg.message_id)
 
 print("Bot Started on Railway...")
+
 bot.infinity_polling()
