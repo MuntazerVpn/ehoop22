@@ -17,6 +17,8 @@ from telebot import types
 # ✅ خلي التوكن بمتغير بيئة لتفادي انكشافه
 BOT_TOKEN = "8423770288:AAGPjI_9TZQXHUGj9bPn7yvORSwQQDHwGJA"
 ADMIN_ID = 6964811817
+
+if not BOT_TOKEN:
     raise SystemExit("❌ BOT_TOKEN missing. Set it as environment variable BOT_TOKEN")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
@@ -1189,4 +1191,3 @@ if __name__ == "__main__":
 
     print("Bot running 🔥")
     run_bot()
-
