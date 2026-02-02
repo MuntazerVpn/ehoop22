@@ -12,14 +12,13 @@ import telebot
 from telebot import types
 
 # =========================
-# CONFIG (أساسي)
+# CONFIG (Railway/GitHub)
 # =========================
-# ✅ Railway/GitHub: خَلّي التوكن من Variables
 BOT_TOKEN = "8423770288:AAGPjI_9TZQXHUGj9bPn7yvORSwQQDHwGJA"
 ADMIN_ID = 6964811817
 
 if not BOT_TOKEN:
-    raise SystemExit("❌ BOT_TOKEN missing. Set it as env var BOT_TOKEN")
+    raise SystemExit("❌ BOT_TOKEN missing. Set env var BOT_TOKEN")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
@@ -29,7 +28,8 @@ USAGE_FILE = "usage.json"
 STATS_FILE = "stats.json"
 COOKIES_FILE = "cookies.txt"
 
-# ✅ إذا تريد cookies من Variable بدل ملف
+# ✅ (اختياري) إذا تريد cookies من Railway Variables بدل ملف:
+# ضع IG_COOKIES في Variables = محتوى cookies.txt كامل
 IG_COOKIES = os.getenv("IG_COOKIES", "").strip()
 if IG_COOKIES:
     try:
@@ -39,11 +39,16 @@ if IG_COOKIES:
         pass
 
 EDIT_THROTTLE_SEC = 1.2
-IDLE_TIMEOUT_SEC = 180  # ✅ إذا yt-dlp ما يطلع output 3 دقائق نعتبره علقان
+IDLE_TIMEOUT_SEC = 180  # timeout إذا yt-dlp سكت فترة طويلة
 
 user_links = {}
 chat_locks = {}
 active_downloads = {}  # chat_id -> {"proc": Popen, "cancel": Event, "dl_id": str, "msg_id": int}
+
+# ✅ تحويل الصوت
+audio_jobs = {}  # job_id -> {"path": str, "title": str, "channel": str, "chat_id": int, "created": float}
+audio_jobs_lock = threading.Lock()
+AUDIO_JOB_TTL = 15 * 60  # 15 دقيقة
 
 # =========================
 # DEFAULT SETTINGS
@@ -215,13 +220,59 @@ def is_admin(user_id: int) -> bool:
     return int(user_id) == int(ADMIN_ID)
 
 # =========================
+# AUDIO CONVERT HELPERS
+# =========================
+def audio_convert_kb(job_id: str):
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("🎧 تحويل إلى MP3", callback_data=f"aud:{job_id}:mp3"),
+        types.InlineKeyboardButton("🎙 بصمة", callback_data=f"aud:{job_id}:voice"),
+    )
+    return kb
+
+def ffmpeg_convert_to_mp3(src_path: str, dst_path: str) -> bool:
+    try:
+        cmd = ["ffmpeg", "-y", "-i", src_path, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", dst_path]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        return os.path.exists(dst_path) and os.path.getsize(dst_path) > 0
+    except:
+        return False
+
+def ffmpeg_convert_to_voice(src_path: str, dst_path: str) -> bool:
+    try:
+        cmd = ["ffmpeg", "-y", "-i", src_path, "-vn", "-c:a", "libopus", "-b:a", "64k", "-vbr", "on", dst_path]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        return os.path.exists(dst_path) and os.path.getsize(dst_path) > 0
+    except:
+        return False
+
+def audio_cleanup_loop():
+    while True:
+        try:
+            now = time.time()
+            with audio_jobs_lock:
+                expired = [k for k, v in audio_jobs.items() if (now - v.get("created", now)) > AUDIO_JOB_TTL]
+                for k in expired:
+                    p = audio_jobs[k].get("path")
+                    try:
+                        if p and os.path.exists(p):
+                            os.remove(p)
+                    except:
+                        pass
+                    audio_jobs.pop(k, None)
+        except:
+            pass
+        time.sleep(30)
+
+# =========================
 # KEYBOARDS
 # =========================
-def start_keyboard():
+def start_keyboard(user_id: int = 0):
+    """✅ زر الأدمن يظهر فقط للأدمن"""
     s = load_settings()
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(s["buttons"]["start_btn"])
-    if ADMIN_ID:
+    if is_admin(user_id):
         kb.row(s["buttons"]["admin_btn"])
     return kb
 
@@ -285,7 +336,7 @@ def ensure_user(m):
                 f"• المستخدم: {uname}\n"
                 f"• ID: <code>{m.from_user.id}</code>\n"
                 f"• عدد المستخدمين: <b>{total}</b>",
-                reply_markup=start_keyboard()
+                reply_markup=start_keyboard(ADMIN_ID)
             )
 
 def is_banned(user_id: int) -> bool:
@@ -345,14 +396,14 @@ def inc_daily(user_id: int):
     usage[key][today] = int(usage[key].get(today, 0)) + 1
     save_usage(usage)
 
-def refuse_plain(chat_id: int):
+def refuse_plain(chat_id: int, user_id: int):
     s = load_settings()
     bot.send_message(
         chat_id,
         "⚠️ <b>أرسل رابط صحيح</b>\n"
         "مثال: https://youtube.com/...\n\n"
         f"اضغط {s['buttons']['start_btn']} للبدء.",
-        reply_markup=start_keyboard()
+        reply_markup=start_keyboard(user_id)
     )
 
 # =========================
@@ -371,12 +422,10 @@ def common_ytdlp_args(domain: str):
         "--retry-sleep", "1",
         "--force-ipv4",
         "--concurrent-fragments", "1",
-        # ✅ تهدئة (مفيدة للإنستغرام)
         "--sleep-interval", "2",
         "--max-sleep-interval", "5",
         "--extractor-retries", "10",
     ]
-
     if "youtube.com" in domain or "youtu.be" in domain:
         args += ["--extractor-args", "youtube:player_client=android"]
 
@@ -394,7 +443,7 @@ def common_ytdlp_args(domain: str):
 
 def build_format(domain: str, mode: str) -> str:
     if mode == "ig_video":
-        # ✅ أهم تعديل: اجبار H.264 (avc1) + AAC (mp4a) لتفادي شاشة سوداء
+        # ✅ اجبار H.264 + AAC (لتفادي الشاشة السوداء)
         return (
             "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
             "best[ext=mp4][vcodec^=avc1]/"
@@ -465,7 +514,7 @@ def fetch_info(url: str, fmt: str, domain: str):
 # =========================
 # DOWNLOAD WITH PROGRESS + CANCEL + WATCHDOG
 # =========================
-def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
+def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id, user_id: int):
     url = normalize_url(url)
     domain = get_domain(url)
 
@@ -499,7 +548,7 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
         if has_ffmpeg():
             extra_args += ["--merge-output-format", "mp4", "--remux-video", "mp4"]
 
-            # ✅ حل الشاشة السوداء: re-encode فقط للإنستغرام إلى H.264 + yuv420p
+            # ✅ re-encode فقط لإنستغرام لتفادي أسود+صوت
             if "instagram.com" in domain:
                 extra_args += [
                     "--postprocessor-args",
@@ -534,7 +583,6 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
         )
         active_downloads[chat_id]["proc"] = proc
 
-        # ✅ Watchdog: يوقف إذا علق بدون output
         def watchdog():
             while proc.poll() is None and not cancel_event.is_set():
                 if time.time() - last_output_t > IDLE_TIMEOUT_SEC:
@@ -543,10 +591,10 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
                     try:
                         bot.edit_message_text(
                             "⛔ <b>Timeout</b>\n"
-                            "انستغرام علّق/منع الطلب مؤقتاً.\n"
+                            "الموقع علّق/منع الطلب مؤقتاً.\n"
                             "✅ جرّب بعد دقيقة وتأكد <code>cookies</code> محدثة.",
                             chat_id, msg_id,
-                            reply_markup=start_keyboard()
+                            reply_markup=start_keyboard(user_id)
                         )
                     except:
                         pass
@@ -562,13 +610,12 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
             if cancel_event.is_set():
                 stop_process(proc)
                 try:
-                    bot.edit_message_text("CANCELLED", chat_id, msg_id, reply_markup=start_keyboard())
+                    bot.edit_message_text("CANCELLED", chat_id, msg_id, reply_markup=start_keyboard(user_id))
                 except:
                     pass
                 log_stat({"ts": time.time(), "type": "cancel", "chat_id": chat_id, "domain": domain})
                 return None, None, None, "CANCELLED"
 
-            # تحديث حالة عامة إذا ماكو %
             if status_re.search(line):
                 now = time.time()
                 if (now - last_update_t) >= EDIT_THROTTLE_SEC:
@@ -625,7 +672,7 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
 
         if cancel_event.is_set():
             try:
-                bot.edit_message_text("CANCELLED", chat_id, msg_id, reply_markup=start_keyboard())
+                bot.edit_message_text("CANCELLED", chat_id, msg_id, reply_markup=start_keyboard(user_id))
             except:
                 pass
             log_stat({"ts": time.time(), "type": "cancel", "chat_id": chat_id, "domain": domain})
@@ -636,7 +683,7 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
                 bot.edit_message_text(
                     "YT_DLP_ERROR\n"
                     "✅ إذا إنستغرام: حدّث <code>cookies</code> وجرب مرة ثانية.",
-                    chat_id, msg_id, reply_markup=start_keyboard()
+                    chat_id, msg_id, reply_markup=start_keyboard(user_id)
                 )
             except:
                 pass
@@ -646,7 +693,7 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
         path = find_file(out_prefix)
         if not path:
             try:
-                bot.edit_message_text("FILE_NOT_FOUND", chat_id, msg_id, reply_markup=start_keyboard())
+                bot.edit_message_text("FILE_NOT_FOUND", chat_id, msg_id, reply_markup=start_keyboard(user_id))
             except:
                 pass
             log_stat({"ts": time.time(), "type": "fail", "reason": "FILE_NOT_FOUND", "chat_id": chat_id, "domain": domain})
@@ -656,13 +703,13 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
 
     except:
         try:
-            bot.edit_message_text("RUNTIME_ERROR", chat_id, msg_id, reply_markup=start_keyboard())
+            bot.edit_message_text("RUNTIME_ERROR", chat_id, msg_id, reply_markup=start_keyboard(user_id))
         except:
             pass
         log_stat({"ts": time.time(), "type": "fail", "reason": "RUNTIME_ERROR", "chat_id": chat_id, "domain": domain})
         return None, None, None, "RUNTIME_ERROR"
 
-def send_result(chat_id: int, msg_id: int, path: str, mode: str, title: str, channel: str):
+def send_result(chat_id: int, msg_id: int, path: str, mode: str, title: str, channel: str, user_id: int):
     s = load_settings()
     bot_link = s.get("bot_public_username") or "@aass554411"
 
@@ -686,12 +733,24 @@ def send_result(chat_id: int, msg_id: int, path: str, mode: str, title: str, cha
 
     with open(path, "rb") as f:
         if mode == "v_audio":
+            # ✅ نخلي الملف حتى المستخدم يختار MP3/بصمة
+            job_id = f"{chat_id}:{int(time.time())}"
+            with audio_jobs_lock:
+                audio_jobs[job_id] = {
+                    "path": path,
+                    "title": title or "Audio",
+                    "channel": channel or "",
+                    "chat_id": chat_id,
+                    "created": time.time(),
+                }
+
             bot.send_audio(
                 chat_id,
                 f,
                 title=title or "Audio",
                 performer=channel or "",
-                caption=(f"🎵 {title}" if title else "🎵") + caption_tail
+                caption=(f"🎵 {title}" if title else "🎵") + caption_tail + "\n\nاختر تحويل 👇",
+                reply_markup=audio_convert_kb(job_id)
             )
         else:
             bot.send_video(
@@ -706,10 +765,12 @@ def send_result(chat_id: int, msg_id: int, path: str, mode: str, title: str, cha
     except:
         pass
 
-    try:
-        os.remove(path)
-    except:
-        pass
+    # ✅ لا نحذف ملف الصوت مباشرة
+    if mode != "v_audio":
+        try:
+            os.remove(path)
+        except:
+            pass
 
 # =========================
 # DOWNLOAD FLOW
@@ -733,19 +794,19 @@ def handle_download(chat_id, url, mode, status_msg_id, user_id):
             "msg_id": status_msg_id
         }
 
-        path, title, channel, fail = ytdlp_download_with_progress(url, mode, chat_id, status_msg_id, dl_id)
+        path, title, channel, fail = ytdlp_download_with_progress(url, mode, chat_id, status_msg_id, dl_id, user_id)
         if fail:
             return
 
         if not path or not os.path.exists(path):
             try:
-                bot.edit_message_text("DOWNLOAD_FAILED", chat_id, status_msg_id, reply_markup=start_keyboard())
+                bot.edit_message_text("DOWNLOAD_FAILED", chat_id, status_msg_id, reply_markup=start_keyboard(user_id))
             except:
                 pass
             log_stat({"ts": time.time(), "type": "fail", "reason": "DOWNLOAD_FAILED", "chat_id": chat_id, "domain": domain})
             return
 
-        send_result(chat_id, status_msg_id, path, mode, title, channel)
+        send_result(chat_id, status_msg_id, path, mode, title, channel, user_id)
         log_stat({
             "ts": time.time(),
             "type": "success",
@@ -836,7 +897,7 @@ def report_loop():
     while True:
         try:
             if ADMIN_ID:
-                bot.send_message(ADMIN_ID, build_report(12), reply_markup=start_keyboard())
+                bot.send_message(ADMIN_ID, build_report(12), reply_markup=start_keyboard(ADMIN_ID))
         except:
             pass
         time.sleep(12 * 3600)
@@ -851,11 +912,11 @@ def start(m):
         return
 
     if not bot_is_enabled_for(m.from_user.id):
-        bot.send_message(m.chat.id, "⛔ البوت متوقف مؤقتاً.", reply_markup=start_keyboard())
+        bot.send_message(m.chat.id, "⛔ البوت متوقف مؤقتاً.", reply_markup=start_keyboard(m.from_user.id))
         return
 
     s = load_settings()
-    bot.send_message(m.chat.id, s["welcome_message"], reply_markup=start_keyboard())
+    bot.send_message(m.chat.id, s["welcome_message"], reply_markup=start_keyboard(m.from_user.id))
 
 @bot.message_handler(commands=["admin"])
 def admin_cmd(m):
@@ -870,7 +931,7 @@ def any_text(m):
 
     if not bot_is_enabled_for(m.from_user.id):
         if not is_admin(m.from_user.id):
-            bot.send_message(m.chat.id, "⛔ البوت متوقف مؤقتاً.", reply_markup=start_keyboard())
+            bot.send_message(m.chat.id, "⛔ البوت متوقف مؤقتاً.", reply_markup=start_keyboard(m.from_user.id))
             return
 
     if is_banned(m.from_user.id):
@@ -880,9 +941,10 @@ def any_text(m):
     txt = (m.text or "").strip()
 
     if txt == s["buttons"]["start_btn"]:
-        bot.send_message(m.chat.id, s["welcome_message"], reply_markup=start_keyboard())
+        bot.send_message(m.chat.id, s["welcome_message"], reply_markup=start_keyboard(m.from_user.id))
         return
 
+    # ✅ زر الأدمن صار يظهر فقط للأدمن من الكيبورد، لكن نتحقق أيضاً
     if txt == s["buttons"]["admin_btn"] and is_admin(m.from_user.id):
         admin_clear()
         bot.send_message(m.chat.id, "⚙️ <b>لوحة الأدمن</b>", reply_markup=admin_panel_kb())
@@ -896,7 +958,7 @@ def any_text(m):
             return
 
     if not txt.startswith("http"):
-        refuse_plain(m.chat.id)
+        refuse_plain(m.chat.id, m.from_user.id)
         return
 
     url = normalize_url(txt)
@@ -918,7 +980,7 @@ def any_text(m):
             m.chat.id,
             f"⚠️ وصلت الحد اليومي.\n"
             f"استخدامك اليوم: <b>{used}</b> / <b>{limit}</b>",
-            reply_markup=start_keyboard()
+            reply_markup=start_keyboard(m.from_user.id)
         )
         return
 
@@ -940,7 +1002,7 @@ def force_check(c):
     uid = c.from_user.id
     if check_forced_join(uid):
         bot.answer_callback_query(c.id, "✅ تم التحقق!")
-        bot.send_message(c.message.chat.id, "✅ تقدر ترسل الرابط الآن.", reply_markup=start_keyboard())
+        bot.send_message(c.message.chat.id, "✅ تقدر ترسل الرابط الآن.", reply_markup=start_keyboard(uid))
     else:
         bot.answer_callback_query(c.id, "❌ بعدك غير مشترك.")
         chans = load_settings().get("forced_channels") or []
@@ -953,6 +1015,7 @@ def force_check(c):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("cancel:"))
 def cancel_download(c):
     chat_id = c.message.chat.id
+    user_id = c.from_user.id
     dl = active_downloads.get(chat_id)
     if not dl:
         try:
@@ -979,7 +1042,7 @@ def cancel_download(c):
     except:
         pass
     try:
-        bot.edit_message_text("CANCELLED", chat_id, dl.get("msg_id", c.message.message_id), reply_markup=start_keyboard())
+        bot.edit_message_text("CANCELLED", chat_id, dl.get("msg_id", c.message.message_id), reply_markup=start_keyboard(user_id))
     except:
         pass
 
@@ -999,12 +1062,72 @@ def process_choice(c):
     msg = bot.send_message(chat_id, "⏳ بدء التحميل...")
 
     if not url:
-        bot.edit_message_text("NO_URL", chat_id, msg.message_id, reply_markup=start_keyboard())
+        bot.edit_message_text("NO_URL", chat_id, msg.message_id, reply_markup=start_keyboard(uid))
         return
 
     mode = c.data
     t = threading.Thread(target=handle_download, args=(chat_id, url, mode, msg.message_id, uid), daemon=True)
     t.start()
+
+# ✅ تحويل الصوت إلى mp3 / بصمة
+@bot.callback_query_handler(func=lambda c: c.data.startswith("aud:"))
+def audio_convert_action(c):
+    try:
+        _, job_id, action = c.data.split(":", 2)
+    except:
+        bot.answer_callback_query(c.id, "زر غير صالح")
+        return
+
+    with audio_jobs_lock:
+        job = audio_jobs.get(job_id)
+
+    if not job:
+        bot.answer_callback_query(c.id, "انتهت صلاحية الملف، أعد التحميل.")
+        return
+
+    chat_id = job["chat_id"]
+    src = job["path"]
+    title = job.get("title") or "Audio"
+    safe = safe_filename(title, 60)
+
+    if not os.path.exists(src):
+        bot.answer_callback_query(c.id, "الملف غير موجود، أعد التحميل.")
+        return
+
+    if not has_ffmpeg():
+        bot.answer_callback_query(c.id, "ffmpeg غير متوفر على السيرفر.")
+        return
+
+    bot.answer_callback_query(c.id, "⏳ جاري التحويل...")
+
+    if action == "mp3":
+        out = f"{safe}.mp3"
+        ok = ffmpeg_convert_to_mp3(src, out)
+        if not ok:
+            bot.send_message(chat_id, "❌ فشل تحويل MP3.")
+            return
+        with open(out, "rb") as f:
+            bot.send_document(chat_id, f, caption=f"🎧 MP3: {title}")
+        try:
+            os.remove(out)
+        except:
+            pass
+
+    elif action == "voice":
+        out = f"{safe}.ogg"
+        ok = ffmpeg_convert_to_voice(src, out)
+        if not ok:
+            bot.send_message(chat_id, "❌ فشل تحويل البصمة.")
+            return
+        with open(out, "rb") as f:
+            bot.send_voice(chat_id, f, caption=f"🎙 بصمة: {title}")
+        try:
+            os.remove(out)
+        except:
+            pass
+
+    else:
+        bot.send_message(chat_id, "❌ خيار غير معروف.")
 
 # =========================
 # ADMIN PANEL CALLBACKS + INPUT
@@ -1154,7 +1277,7 @@ def handle_admin_input(m, step: str, data: dict):
                 uid = int(uid_str)
                 if u.get("banned"):
                     continue
-                bot.send_message(uid, txt, reply_markup=start_keyboard())
+                bot.send_message(uid, txt, reply_markup=start_keyboard(uid))
                 ok += 1
             except:
                 fail += 1
@@ -1205,6 +1328,9 @@ def run_bot():
 if __name__ == "__main__":
     if ADMIN_ID:
         threading.Thread(target=report_loop, daemon=True).start()
+
+    # ✅ تنظيف ملفات الصوت المؤقتة
+    threading.Thread(target=audio_cleanup_loop, daemon=True).start()
 
     print("Bot running 🔥")
     run_bot()
