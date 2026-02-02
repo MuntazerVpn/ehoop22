@@ -14,12 +14,12 @@ from telebot import types
 # =========================
 # CONFIG (أساسي)
 # =========================
-# ✅ خلي التوكن بمتغير بيئة لتفادي انكشافه
+# ✅ Railway/GitHub: خَلّي التوكن من Variables
 BOT_TOKEN = "8423770288:AAGPjI_9TZQXHUGj9bPn7yvORSwQQDHwGJA"
 ADMIN_ID = 6964811817
 
 if not BOT_TOKEN:
-    raise SystemExit("❌ BOT_TOKEN missing. Set it as environment variable BOT_TOKEN")
+    raise SystemExit("❌ BOT_TOKEN missing. Set it as env var BOT_TOKEN")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
@@ -29,8 +29,17 @@ USAGE_FILE = "usage.json"
 STATS_FILE = "stats.json"
 COOKIES_FILE = "cookies.txt"
 
+# ✅ إذا تريد cookies من Variable بدل ملف
+IG_COOKIES = os.getenv("IG_COOKIES", "").strip()
+if IG_COOKIES:
+    try:
+        with open(COOKIES_FILE, "w", encoding="utf-8") as f:
+            f.write(IG_COOKIES)
+    except:
+        pass
+
 EDIT_THROTTLE_SEC = 1.2
-IDLE_TIMEOUT_SEC = 180  # ✅ اذا yt-dlp ما يطلع اي سطر 3 دقائق اعتبره علقان ووقفه
+IDLE_TIMEOUT_SEC = 180  # ✅ إذا yt-dlp ما يطلع output 3 دقائق نعتبره علقان
 
 user_links = {}
 chat_locks = {}
@@ -309,8 +318,7 @@ def check_forced_join(user_id: int) -> bool:
 
     for ch in channels:
         try:
-            ch_id = ch
-            mem = bot.get_chat_member(ch_id, user_id)
+            mem = bot.get_chat_member(ch, user_id)
             if mem.status in ("left", "kicked"):
                 return False
         except:
@@ -348,7 +356,7 @@ def refuse_plain(chat_id: int):
     )
 
 # =========================
-# yt-dlp ARGS / FORMATS (✅ تحسين إنستغرام)
+# yt-dlp ARGS / FORMATS
 # =========================
 def common_ytdlp_args(domain: str):
     args = [
@@ -363,8 +371,7 @@ def common_ytdlp_args(domain: str):
         "--retry-sleep", "1",
         "--force-ipv4",
         "--concurrent-fragments", "1",
-
-        # ✅ مهم: يقلل الحظر/الضغط خصوصاً بالإنستغرام
+        # ✅ تهدئة (مفيدة للإنستغرام)
         "--sleep-interval", "2",
         "--max-sleep-interval", "5",
         "--extractor-retries", "10",
@@ -387,8 +394,12 @@ def common_ytdlp_args(domain: str):
 
 def build_format(domain: str, mode: str) -> str:
     if mode == "ig_video":
-        # ✅ فورمات أقوى لإنستغرام (يفك مشاكل عدم وجود صوت/ستريمات منفصلة)
-        return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        # ✅ أهم تعديل: اجبار H.264 (avc1) + AAC (mp4a) لتفادي شاشة سوداء
+        return (
+            "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
+            "best[ext=mp4][vcodec^=avc1]/"
+            "best"
+        )
     if mode == "v_audio":
         return "bestaudio[ext=m4a]/bestaudio/best"
     if mode == "v_720":
@@ -452,7 +463,7 @@ def fetch_info(url: str, fmt: str, domain: str):
         return None
 
 # =========================
-# DOWNLOAD WITH PROGRESS + CANCEL + WATCHDOG (✅ إنستغرام ما يعلق)
+# DOWNLOAD WITH PROGRESS + CANCEL + WATCHDOG
 # =========================
 def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
     url = normalize_url(url)
@@ -486,7 +497,14 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
     extra_args = []
     if mode != "v_audio":
         if has_ffmpeg():
-            extra_args += ["--merge-output-format", "mp4"]
+            extra_args += ["--merge-output-format", "mp4", "--remux-video", "mp4"]
+
+            # ✅ حل الشاشة السوداء: re-encode فقط للإنستغرام إلى H.264 + yuv420p
+            if "instagram.com" in domain:
+                extra_args += [
+                    "--postprocessor-args",
+                    "ffmpeg:-c:v libx264 -pix_fmt yuv420p -c:a aac -b:a 128k -movflags +faststart"
+                ]
         else:
             extra_args += ["--format-sort", "ext:mp4"]
     else:
@@ -502,7 +520,6 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
 
     last_update_t = 0.0
     cancel_event = active_downloads[chat_id]["cancel"]
-
     last_output_t = time.time()
     timed_out_flag = {"hit": False}
 
@@ -517,7 +534,7 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
         )
         active_downloads[chat_id]["proc"] = proc
 
-        # ✅ Watchdog: اذا ماكو output فترة طويلة = علقان
+        # ✅ Watchdog: يوقف إذا علق بدون output
         def watchdog():
             while proc.poll() is None and not cancel_event.is_set():
                 if time.time() - last_output_t > IDLE_TIMEOUT_SEC:
@@ -527,7 +544,7 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
                         bot.edit_message_text(
                             "⛔ <b>Timeout</b>\n"
                             "انستغرام علّق/منع الطلب مؤقتاً.\n"
-                            "✅ جرّب بعد دقيقة، وتأكد ملف <code>cookies.txt</code> محدث.",
+                            "✅ جرّب بعد دقيقة وتأكد <code>cookies</code> محدثة.",
                             chat_id, msg_id,
                             reply_markup=start_keyboard()
                         )
@@ -551,7 +568,7 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
                 log_stat({"ts": time.time(), "type": "cancel", "chat_id": chat_id, "domain": domain})
                 return None, None, None, "CANCELLED"
 
-            # ✅ اذا ماكو % بس اكو استخراج/تحضير، سو تحديث حتى لا يبان واقف
+            # تحديث حالة عامة إذا ماكو %
             if status_re.search(line):
                 now = time.time()
                 if (now - last_update_t) >= EDIT_THROTTLE_SEC:
@@ -618,7 +635,7 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id):
             try:
                 bot.edit_message_text(
                     "YT_DLP_ERROR\n"
-                    "✅ إذا إنستغرام: حدّث <code>cookies.txt</code> وجرب مرة ثانية.",
+                    "✅ إذا إنستغرام: حدّث <code>cookies</code> وجرب مرة ثانية.",
                     chat_id, msg_id, reply_markup=start_keyboard()
                 )
             except:
@@ -990,7 +1007,7 @@ def process_choice(c):
     t.start()
 
 # =========================
-# ADMIN PANEL CALLBACKS
+# ADMIN PANEL CALLBACKS + INPUT
 # =========================
 @bot.callback_query_handler(func=lambda c: c.data.startswith("adm:"))
 def admin_actions(c):
