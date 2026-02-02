@@ -5,6 +5,7 @@ import json
 import time
 import threading
 import subprocess
+import secrets
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -28,8 +29,7 @@ USAGE_FILE = "usage.json"
 STATS_FILE = "stats.json"
 COOKIES_FILE = "cookies.txt"
 
-# ✅ (اختياري) إذا تريد cookies من Railway Variables بدل ملف:
-# ضع IG_COOKIES في Variables = محتوى cookies.txt كامل
+# (اختياري) cookies من Railway Variables (ضع IG_COOKIES = محتوى cookies.txt)
 IG_COOKIES = os.getenv("IG_COOKIES", "").strip()
 if IG_COOKIES:
     try:
@@ -39,7 +39,7 @@ if IG_COOKIES:
         pass
 
 EDIT_THROTTLE_SEC = 1.2
-IDLE_TIMEOUT_SEC = 180  # timeout إذا yt-dlp سكت فترة طويلة
+IDLE_TIMEOUT_SEC = 180
 
 user_links = {}
 chat_locks = {}
@@ -225,8 +225,8 @@ def is_admin(user_id: int) -> bool:
 def audio_convert_kb(job_id: str):
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
-        types.InlineKeyboardButton("🎧 تحويل إلى MP3", callback_data=f"aud:{job_id}:mp3"),
-        types.InlineKeyboardButton("🎙 بصمة", callback_data=f"aud:{job_id}:voice"),
+        types.InlineKeyboardButton("🎧 تحويل إلى MP3", callback_data=f"aud|mp3|{job_id}"),
+        types.InlineKeyboardButton("🎙 بصمة", callback_data=f"aud|voice|{job_id}"),
     )
     return kb
 
@@ -268,7 +268,6 @@ def audio_cleanup_loop():
 # KEYBOARDS
 # =========================
 def start_keyboard(user_id: int = 0):
-    """✅ زر الأدمن يظهر فقط للأدمن"""
     s = load_settings()
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(s["buttons"]["start_btn"])
@@ -443,7 +442,6 @@ def common_ytdlp_args(domain: str):
 
 def build_format(domain: str, mode: str) -> str:
     if mode == "ig_video":
-        # ✅ اجبار H.264 + AAC (لتفادي الشاشة السوداء)
         return (
             "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
             "best[ext=mp4][vcodec^=avc1]/"
@@ -483,7 +481,6 @@ def fetch_info(url: str, fmt: str, domain: str):
             return None
 
         info = json.loads(p.stdout)
-
         title = info.get("title") or "بدون عنوان"
         channel = info.get("channel") or info.get("uploader") or info.get("uploader_id") or "غير معروف"
         upload_date = fmt_upload_date(info.get("upload_date") or "")
@@ -547,8 +544,6 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id, user_id: int
     if mode != "v_audio":
         if has_ffmpeg():
             extra_args += ["--merge-output-format", "mp4", "--remux-video", "mp4"]
-
-            # ✅ re-encode فقط لإنستغرام لتفادي أسود+صوت
             if "instagram.com" in domain:
                 extra_args += [
                     "--postprocessor-args",
@@ -733,8 +728,7 @@ def send_result(chat_id: int, msg_id: int, path: str, mode: str, title: str, cha
 
     with open(path, "rb") as f:
         if mode == "v_audio":
-            # ✅ نخلي الملف حتى المستخدم يختار MP3/بصمة
-            job_id = f"{chat_id}:{int(time.time())}"
+            job_id = secrets.token_hex(6)
             with audio_jobs_lock:
                 audio_jobs[job_id] = {
                     "path": path,
@@ -765,7 +759,6 @@ def send_result(chat_id: int, msg_id: int, path: str, mode: str, title: str, cha
     except:
         pass
 
-    # ✅ لا نحذف ملف الصوت مباشرة
     if mode != "v_audio":
         try:
             os.remove(path)
@@ -944,7 +937,6 @@ def any_text(m):
         bot.send_message(m.chat.id, s["welcome_message"], reply_markup=start_keyboard(m.from_user.id))
         return
 
-    # ✅ زر الأدمن صار يظهر فقط للأدمن من الكيبورد، لكن نتحقق أيضاً
     if txt == s["buttons"]["admin_btn"] and is_admin(m.from_user.id):
         admin_clear()
         bot.send_message(m.chat.id, "⚙️ <b>لوحة الأدمن</b>", reply_markup=admin_panel_kb())
@@ -1069,14 +1061,14 @@ def process_choice(c):
     t = threading.Thread(target=handle_download, args=(chat_id, url, mode, msg.message_id, uid), daemon=True)
     t.start()
 
-# ✅ تحويل الصوت إلى mp3 / بصمة
-@bot.callback_query_handler(func=lambda c: c.data.startswith("aud:"))
+@bot.callback_query_handler(func=lambda c: c.data.startswith("aud|"))
 def audio_convert_action(c):
-    try:
-        _, job_id, action = c.data.split(":", 2)
-    except:
+    parts = c.data.split("|", 2)
+    if len(parts) != 3:
         bot.answer_callback_query(c.id, "زر غير صالح")
         return
+
+    _, action, job_id = parts
 
     with audio_jobs_lock:
         job = audio_jobs.get(job_id)
@@ -1089,6 +1081,10 @@ def audio_convert_action(c):
     src = job["path"]
     title = job.get("title") or "Audio"
     safe = safe_filename(title, 60)
+
+    if c.message.chat.id != chat_id:
+        bot.answer_callback_query(c.id, "هذا الزر مو الك.")
+        return
 
     if not os.path.exists(src):
         bot.answer_callback_query(c.id, "الملف غير موجود، أعد التحميل.")
@@ -1125,9 +1121,8 @@ def audio_convert_action(c):
             os.remove(out)
         except:
             pass
-
     else:
-        bot.send_message(chat_id, "❌ خيار غير معروف.")
+        bot.answer_callback_query(c.id, "خيار غير معروف")
 
 # =========================
 # ADMIN PANEL CALLBACKS + INPUT
@@ -1329,7 +1324,6 @@ if __name__ == "__main__":
     if ADMIN_ID:
         threading.Thread(target=report_loop, daemon=True).start()
 
-    # ✅ تنظيف ملفات الصوت المؤقتة
     threading.Thread(target=audio_cleanup_loop, daemon=True).start()
 
     print("Bot running 🔥")
