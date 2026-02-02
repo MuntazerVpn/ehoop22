@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import os
 import re
 import sys
@@ -1190,3 +1189,4 @@ if __name__ == "__main__":
 
     print("Bot running 🔥")
     run_bot()
+
