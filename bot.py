@@ -12,11 +12,10 @@ import telebot
 from telebot import types
 
 # =========================
-# CONFIG (أساسي)
+# CONFIG
 # =========================
 BOT_TOKEN = "8423770288:AAGPjI_9TZQXHUGj9bPn7yvORSwQQDHwGJA"
 ADMIN_ID = 6964811817
-
 if not BOT_TOKEN:
     raise SystemExit("❌ BOT_TOKEN missing. Set it as env var BOT_TOKEN")
 
@@ -37,11 +36,13 @@ if IG_COOKIES:
         pass
 
 EDIT_THROTTLE_SEC = 1.2
-IDLE_TIMEOUT_SEC = 180
+IDLE_TIMEOUT_SEC = 180  # عام لكل المواقع
+MAX_ATTEMPTS = 2        # إعادة محاولة مرة وحدة
+BACKOFF_SEC = [0, 15]   # تأخير قبل المحاولة الثانية
 
 user_links = {}
 chat_locks = {}
-active_downloads = {}
+active_downloads = {}  # chat_id -> {"proc": Popen, "cancel": Event, "dl_id": str, "msg_id": int}
 
 # =========================
 # DEFAULT SETTINGS
@@ -356,26 +357,30 @@ def refuse_plain(chat_id: int, user_id: int):
 # =========================
 # yt-dlp ARGS / FORMATS
 # =========================
+def youtube_client_args(attempt: int):
+    if attempt <= 0:
+        return ["--extractor-args", "youtube:player_client=android"]
+    return ["--extractor-args", "youtube:player_client=web"]
+
 def common_ytdlp_args(domain: str):
     args = [
         "--no-playlist",
         "--no-color",
         "--newline",
         "--force-overwrites",
-        "--socket-timeout", "30",
-        "--retries", "10",
-        "--fragment-retries", "10",
-        "--file-access-retries", "10",
+        "--no-check-certificate",
+        "--socket-timeout", "20",
+        "--retries", "20",
+        "--fragment-retries", "20",
+        "--file-access-retries", "20",
         "--retry-sleep", "1",
         "--force-ipv4",
         "--concurrent-fragments", "1",
         "--sleep-interval", "2",
-        "--max-sleep-interval", "5",
-        "--extractor-retries", "10",
+        "--max-sleep-interval", "6",
+        "--extractor-retries", "20",
+        "--http-chunk-size", "10M",
     ]
-
-    if "youtube.com" in domain or "youtu.be" in domain:
-        args += ["--extractor-args", "youtube:player_client=android"]
 
     if "instagram.com" in domain:
         args += [
@@ -387,6 +392,7 @@ def common_ytdlp_args(domain: str):
         ]
         if os.path.exists(COOKIES_FILE):
             args += ["--cookies", COOKIES_FILE]
+
     return args
 
 def build_format(domain: str, mode: str) -> str:
@@ -414,7 +420,11 @@ def find_file(prefix: str):
 # =========================
 def fetch_info(url: str, fmt: str, domain: str):
     try:
-        cmd = ["yt-dlp"] + common_ytdlp_args(domain) + ["-f", fmt, "-J", url]
+        cmd = ["yt-dlp"] + common_ytdlp_args(domain)
+        if "youtube.com" in domain or "youtu.be" in domain:
+            cmd += youtube_client_args(0)
+        cmd += ["-f", fmt, "-J", url]
+
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
         if p.returncode != 0 or not p.stdout.strip():
             return None
@@ -449,7 +459,7 @@ def fetch_info(url: str, fmt: str, domain: str):
         return None
 
 # =========================
-# DOWNLOAD WITH PROGRESS + CANCEL + WATCHDOG
+# DOWNLOAD WITH PROGRESS + CANCEL + WATCHDOG + RETRY
 # =========================
 def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id, user_id):
     url = normalize_url(url)
@@ -466,17 +476,17 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id, user_id):
     duration = info.get("duration", "غير معروف")
     size_str = human_size(info.get("size_bytes"))
 
-    pre = (
+    base_pre = (
         "📌 <b>معلومات قبل التحميل</b>\n"
         f"🎬 <b>العنوان:</b> {title}\n"
         f"👤 <b>القناة/الناشر:</b> {channel}\n"
         f"📅 <b>تاريخ النشر:</b> {upload_date}\n"
         f"⏱️ <b>المدة:</b> {duration}\n"
         f"📦 <b>الحجم التقريبي:</b> {size_str}\n\n"
-        "⬇️ <b>التحميل:</b> 0%"
     )
+
     try:
-        bot.edit_message_text(pre, chat_id, msg_id, reply_markup=cancel_keyboard(dl_id))
+        bot.edit_message_text(base_pre + "⬇️ <b>التحميل:</b> 0%", chat_id, msg_id, reply_markup=cancel_keyboard(dl_id))
     except:
         pass
 
@@ -498,154 +508,173 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id, user_id):
         else:
             extra_args += ["--format-sort", "ext:mp4"]
 
-    cmd = ["yt-dlp"] + common_ytdlp_args(domain) + ["-f", fmt] + extra_args + ["-o", out_tmpl, url]
-
     percent_re = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
     eta_re = re.compile(r"ETA\s+(\d+:\d+|\d+)")
     speed_re = re.compile(r"at\s+([0-9.]+\w+/s)")
     status_re = re.compile(r"(Downloading|Extracting|Requesting|Fetching|webpage|JSON|API|Retry)", re.IGNORECASE)
 
-    last_update_t = 0.0
     cancel_event = active_downloads[chat_id]["cancel"]
-    last_output_t = time.time()
-    timed_out_flag = {"hit": False}
 
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            universal_newlines=True
-        )
-        active_downloads[chat_id]["proc"] = proc
+    def make_cmd(attempt: int):
+        cmd = ["yt-dlp"] + common_ytdlp_args(domain)
+        if "youtube.com" in domain or "youtu.be" in domain:
+            cmd += youtube_client_args(attempt)
+        cmd += ["-f", fmt] + extra_args + ["-o", out_tmpl, url]
+        return cmd
 
-        def watchdog():
-            while proc.poll() is None and not cancel_event.is_set():
-                if time.time() - last_output_t > IDLE_TIMEOUT_SEC:
-                    timed_out_flag["hit"] = True
-                    stop_process(proc)
-                    try:
-                        bot.edit_message_text(
-                            "⛔ <b>Timeout</b>\n"
-                            "انستغرام علّق/منع الطلب مؤقتاً.\n"
-                            "✅ جرّب بعد دقيقة وتأكد <code>cookies</code> محدثة.",
-                            chat_id, msg_id,
-                            reply_markup=start_keyboard(user_id)
-                        )
-                    except:
-                        pass
-                    log_stat({"ts": time.time(), "type": "fail", "reason": "TIMEOUT", "chat_id": chat_id, "domain": domain})
-                    return
-                time.sleep(2)
-
-        threading.Thread(target=watchdog, daemon=True).start()
-
-        for line in proc.stdout:
-            last_output_t = time.time()
-
-            if cancel_event.is_set():
-                stop_process(proc)
-                try:
-                    bot.edit_message_text("CANCELLED", chat_id, msg_id, reply_markup=start_keyboard(user_id))
-                except:
-                    pass
-                log_stat({"ts": time.time(), "type": "cancel", "chat_id": chat_id, "domain": domain})
-                return None, None, None, None, "CANCELLED"
-
-            if status_re.search(line):
-                now = time.time()
-                if (now - last_update_t) >= EDIT_THROTTLE_SEC:
-                    last_update_t = now
-                    try:
-                        bot.edit_message_text(
-                            pre.replace("⬇️ <b>التحميل:</b> 0%", "⏳ <b>جارِ التحضير/الاستخراج...</b>"),
-                            chat_id, msg_id,
-                            reply_markup=cancel_keyboard(dl_id)
-                        )
-                    except:
-                        pass
-
-            m = percent_re.search(line)
-            if not m:
-                continue
-
-            pct_int = int(float(m.group(1)))
-            now = time.time()
-            if (now - last_update_t) < EDIT_THROTTLE_SEC:
-                continue
-            last_update_t = now
-
-            eta_m = eta_re.search(line)
-            speed_m = speed_re.search(line)
-            eta = eta_m.group(1) if eta_m else ""
-            spd = speed_m.group(1) if speed_m else ""
-
-            extra = []
-            if spd:
-                extra.append(f"🚀 {spd}")
-            if eta:
-                extra.append(f"⏳ ETA {eta}")
-
-            progress_text = (
-                "📌 <b>معلومات قبل التحميل</b>\n"
-                f"🎬 <b>العنوان:</b> {title}\n"
-                f"👤 <b>القناة/الناشر:</b> {channel}\n"
-                f"📅 <b>تاريخ النشر:</b> {upload_date}\n"
-                f"⏱️ <b>المدة:</b> {duration}\n"
-                f"📦 <b>الحجم التقريبي:</b> {size_str}\n\n"
-                f"⬇️ <b>التحميل:</b> {pct_int}%"
-                + (f"\n{' | '.join(extra)}" if extra else "")
-            )
-            try:
-                bot.edit_message_text(progress_text, chat_id, msg_id, reply_markup=cancel_keyboard(dl_id))
-            except:
-                pass
-
-        ret = proc.wait()
-
-        if timed_out_flag["hit"]:
-            return None, None, None, None, "TIMEOUT"
-
+    for attempt in range(MAX_ATTEMPTS):
         if cancel_event.is_set():
-            try:
-                bot.edit_message_text("CANCELLED", chat_id, msg_id, reply_markup=start_keyboard(user_id))
-            except:
-                pass
-            log_stat({"ts": time.time(), "type": "cancel", "chat_id": chat_id, "domain": domain})
             return None, None, None, None, "CANCELLED"
 
-        if ret != 0:
+        if BACKOFF_SEC[min(attempt, len(BACKOFF_SEC)-1)]:
+            time.sleep(BACKOFF_SEC[min(attempt, len(BACKOFF_SEC)-1)])
+
+        if attempt > 0:
             try:
                 bot.edit_message_text(
-                    "YT_DLP_ERROR\n"
-                    "✅ إذا إنستغرام: حدّث <code>cookies</code> وجرب مرة ثانية.",
-                    chat_id, msg_id, reply_markup=start_keyboard(user_id)
+                    base_pre + f"🔁 <b>إعادة محاولة ({attempt+1}/{MAX_ATTEMPTS})...</b>",
+                    chat_id, msg_id,
+                    reply_markup=cancel_keyboard(dl_id)
                 )
             except:
                 pass
-            log_stat({"ts": time.time(), "type": "fail", "reason": "YT_DLP_ERROR", "chat_id": chat_id, "domain": domain})
-            return None, None, None, None, "YT_DLP_ERROR"
 
-        path = find_file(out_prefix)
-        if not path:
+        cmd = make_cmd(attempt)
+
+        last_update_t = 0.0
+        last_output_t = time.time()
+        timed_out_flag = {"hit": False}
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
+            active_downloads[chat_id]["proc"] = proc
+
+            def watchdog():
+                while proc.poll() is None and not cancel_event.is_set():
+                    if time.time() - last_output_t > IDLE_TIMEOUT_SEC:
+                        timed_out_flag["hit"] = True
+                        stop_process(proc)
+                        return
+                    time.sleep(2)
+
+            threading.Thread(target=watchdog, daemon=True).start()
+
+            for line in proc.stdout:
+                last_output_t = time.time()
+
+                if cancel_event.is_set():
+                    stop_process(proc)
+                    try:
+                        bot.edit_message_text("CANCELLED", chat_id, msg_id, reply_markup=start_keyboard(user_id))
+                    except:
+                        pass
+                    log_stat({"ts": time.time(), "type": "cancel", "chat_id": chat_id, "domain": domain})
+                    return None, None, None, None, "CANCELLED"
+
+                if status_re.search(line):
+                    now = time.time()
+                    if (now - last_update_t) >= EDIT_THROTTLE_SEC:
+                        last_update_t = now
+                        try:
+                            bot.edit_message_text(
+                                base_pre + "⏳ <b>جارِ التحضير/الاستخراج...</b>",
+                                chat_id, msg_id,
+                                reply_markup=cancel_keyboard(dl_id)
+                            )
+                        except:
+                            pass
+
+                m = percent_re.search(line)
+                if not m:
+                    continue
+
+                pct_int = int(float(m.group(1)))
+                now = time.time()
+                if (now - last_update_t) < EDIT_THROTTLE_SEC:
+                    continue
+                last_update_t = now
+
+                eta_m = eta_re.search(line)
+                speed_m = speed_re.search(line)
+                eta = eta_m.group(1) if eta_m else ""
+                spd = speed_m.group(1) if speed_m else ""
+
+                extra = []
+                if spd:
+                    extra.append(f"🚀 {spd}")
+                if eta:
+                    extra.append(f"⏳ ETA {eta}")
+
+                progress_text = base_pre + f"⬇️ <b>التحميل:</b> {pct_int}%" + (f"\n{' | '.join(extra)}" if extra else "")
+                try:
+                    bot.edit_message_text(progress_text, chat_id, msg_id, reply_markup=cancel_keyboard(dl_id))
+                except:
+                    pass
+
+            ret = proc.wait()
+
+            if cancel_event.is_set():
+                return None, None, None, None, "CANCELLED"
+
+            if timed_out_flag["hit"]:
+                if attempt < MAX_ATTEMPTS - 1:
+                    continue
+                try:
+                    bot.edit_message_text(
+                        "⛔ <b>Timeout</b>\n"
+                        "التحميل علّق/النت بطيء أو الموقع منع الطلب مؤقتاً.\n"
+                        "✅ جرّب بعد دقيقة.",
+                        chat_id, msg_id,
+                        reply_markup=start_keyboard(user_id)
+                    )
+                except:
+                    pass
+                log_stat({"ts": time.time(), "type": "fail", "reason": "TIMEOUT", "chat_id": chat_id, "domain": domain})
+                return None, None, None, None, "TIMEOUT"
+
+            if ret != 0:
+                if attempt < MAX_ATTEMPTS - 1:
+                    continue
+                try:
+                    bot.edit_message_text(
+                        "YT_DLP_ERROR\n"
+                        "✅ جرّب بعد دقيقة أو جرّب رابط ثاني.",
+                        chat_id, msg_id, reply_markup=start_keyboard(user_id)
+                    )
+                except:
+                    pass
+                log_stat({"ts": time.time(), "type": "fail", "reason": "YT_DLP_ERROR", "chat_id": chat_id, "domain": domain})
+                return None, None, None, None, "YT_DLP_ERROR"
+
+            path = find_file(out_prefix)
+            if not path:
+                try:
+                    bot.edit_message_text("FILE_NOT_FOUND", chat_id, msg_id, reply_markup=start_keyboard(user_id))
+                except:
+                    pass
+                log_stat({"ts": time.time(), "type": "fail", "reason": "FILE_NOT_FOUND", "chat_id": chat_id, "domain": domain})
+                return None, None, None, None, "FILE_NOT_FOUND"
+
+            return path, title, channel, duration, None
+
+        except:
+            if attempt < MAX_ATTEMPTS - 1:
+                continue
             try:
-                bot.edit_message_text("FILE_NOT_FOUND", chat_id, msg_id, reply_markup=start_keyboard(user_id))
+                bot.edit_message_text("RUNTIME_ERROR", chat_id, msg_id, reply_markup=start_keyboard(user_id))
             except:
                 pass
-            log_stat({"ts": time.time(), "type": "fail", "reason": "FILE_NOT_FOUND", "chat_id": chat_id, "domain": domain})
-            return None, None, None, None, "FILE_NOT_FOUND"
+            log_stat({"ts": time.time(), "type": "fail", "reason": "RUNTIME_ERROR", "chat_id": chat_id, "domain": domain})
+            return None, None, None, None, "RUNTIME_ERROR"
 
-        return path, title, channel, duration, None
-
-    except:
-        try:
-            bot.edit_message_text("RUNTIME_ERROR", chat_id, msg_id, reply_markup=start_keyboard(user_id))
-        except:
-            pass
-        log_stat({"ts": time.time(), "type": "fail", "reason": "RUNTIME_ERROR", "chat_id": chat_id, "domain": domain})
-        return None, None, None, None, "RUNTIME_ERROR"
+    return None, None, None, None, "DOWNLOAD_FAILED"
 
 def send_result(chat_id: int, msg_id: int, path: str, mode: str, title: str, channel: str, duration: str):
     s = load_settings()
