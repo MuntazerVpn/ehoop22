@@ -14,7 +14,6 @@ from telebot import types
 # =========================
 # CONFIG (أساسي)
 # =========================
-# ✅ الأفضل: خَلّي التوكن من Variables (Railway/GitHub)
 BOT_TOKEN = "8423770288:AAGPjI_9TZQXHUGj9bPn7yvORSwQQDHwGJA"
 ADMIN_ID = 6964811817
 
@@ -29,7 +28,6 @@ USAGE_FILE = "usage.json"
 STATS_FILE = "stats.json"
 COOKIES_FILE = "cookies.txt"
 
-# ✅ إذا تريد cookies من Variable بدل ملف
 IG_COOKIES = os.getenv("IG_COOKIES", "").strip()
 if IG_COOKIES:
     try:
@@ -39,11 +37,11 @@ if IG_COOKIES:
         pass
 
 EDIT_THROTTLE_SEC = 1.2
-IDLE_TIMEOUT_SEC = 180  # ✅ إذا yt-dlp ما يطلع output 3 دقائق نعتبره علقان
+IDLE_TIMEOUT_SEC = 180
 
 user_links = {}
 chat_locks = {}
-active_downloads = {}  # chat_id -> {"proc": Popen, "cancel": Event, "dl_id": str, "msg_id": int}
+active_downloads = {}
 
 # =========================
 # DEFAULT SETTINGS
@@ -55,7 +53,7 @@ DEFAULT_SETTINGS = {
         "👋 <b>هلا بيك!</b>\n"
         "أنا بوت التحميل مالك: <b>منتظر</b>\n\n"
         "✅ أرسل الرابط مباشرة\n"
-        "🔹 يوتيوب/تيك توك: <b>720p</b> أو <b>480p</b> أو <b>صوت</b>\n"
+        "🔹 يوتيوب/تيك توك: <b>مقطع</b> أو <b>ملف صوتي</b> أو <b>بصمة</b>\n"
         "🔹 إنستغرام: فيديو فقط\n\n"
         "🛑 تقدر تلغي التحميل أثناء التشغيل\n"
         "⚠️ الحد اليومي لكل مستخدم: <b>20 رابط</b>\n"
@@ -67,14 +65,9 @@ DEFAULT_SETTINGS = {
     "buttons": {
         "start_btn": "✅ بدء",
         "admin_btn": "⚙️ ادمن",
-        "v720": "🎬 فيديو 720p",
-        "v480": "🎬 فيديو 480p",
-
-        # ✅ صوت (3 خيارات)
-        "audio_m4a": "🎵 صوت عادي (M4A)",
-        "audio_mp3": "🎶 صوت MP3",
-        "voice_note": "🎙️ بصمة (Voice)",
-
+        "clip": "🎬 مقطع فيديو",
+        "audio_file": "🎵 ملف صوتي",
+        "voice_note": "🎙️ بصمة صوتية",
         "ig_video": "📸 تحميل فيديو (إنستغرام)",
         "cancel": "🛑 إلغاء التحميل",
     },
@@ -226,11 +219,8 @@ def start_keyboard(user_id: int = None):
     s = load_settings()
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(s["buttons"]["start_btn"])
-
-    # ✅ زر الأدمن يظهر فقط للأدمن
     if user_id is not None and is_admin(user_id):
         kb.row(s["buttons"]["admin_btn"])
-
     return kb
 
 def cancel_keyboard(dl_id: str):
@@ -379,7 +369,6 @@ def common_ytdlp_args(domain: str):
         "--retry-sleep", "1",
         "--force-ipv4",
         "--concurrent-fragments", "1",
-        # ✅ تهدئة (مفيدة للإنستغرام)
         "--sleep-interval", "2",
         "--max-sleep-interval", "5",
         "--extractor-retries", "10",
@@ -402,29 +391,15 @@ def common_ytdlp_args(domain: str):
 
 def build_format(domain: str, mode: str) -> str:
     if mode == "ig_video":
-        # ✅ إنستغرام: اجبار H.264 (avc1) + AAC (mp4a) لتفادي شاشة سوداء
         return (
             "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
             "best[ext=mp4][vcodec^=avc1]/"
             "best"
         )
-
-    # ✅ الصوت (3 خيارات) كلها تعتمد bestaudio
-    if mode in ("a_m4a", "a_mp3", "a_voice"):
+    if mode == "v_clip":
+        return "best[ext=mp4][vcodec!=none][acodec!=none]/best"
+    if mode in ("a_m4a", "a_voice"):
         return "bestaudio/best"
-
-    if mode == "v_720":
-        return (
-            "best[height<=720][ext=mp4][vcodec!=none][acodec!=none]/"
-            "best[ext=mp4][vcodec!=none][acodec!=none]/"
-            "best"
-        )
-    if mode == "v_480":
-        return (
-            "best[height<=480][ext=mp4][vcodec!=none][acodec!=none]/"
-            "best[ext=mp4][vcodec!=none][acodec!=none]/"
-            "best"
-        )
     return "best"
 
 def find_file(prefix: str):
@@ -506,27 +481,15 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id, user_id):
         pass
 
     extra_args = []
-
-    # ✅ الصوت: عادي / mp3 / بصمة
-    if mode in ("a_m4a", "a_mp3", "a_voice"):
+    if mode in ("a_m4a", "a_voice"):
         if has_ffmpeg():
             if mode == "a_m4a":
                 extra_args += ["-x", "--audio-format", "m4a", "--audio-quality", "0"]
-            elif mode == "a_mp3":
-                extra_args += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
-            elif mode == "a_voice":
-                # نطلع opus ثم نحوله للبصمة OGG/OPUS عند الإرسال إذا احتاج
+            else:
                 extra_args += ["-x", "--audio-format", "opus", "--audio-quality", "0"]
-        else:
-            # بدون ffmpeg قد يفشل استخراج الصوت حسب المصدر
-            pass
-
     else:
-        # فيديو
         if has_ffmpeg():
             extra_args += ["--merge-output-format", "mp4", "--remux-video", "mp4"]
-
-            # ✅ حل الشاشة السوداء للإنستغرام: إعادة ترميز إلى H.264 + yuv420p
             if "instagram.com" in domain:
                 extra_args += [
                     "--postprocessor-args",
@@ -558,7 +521,6 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id, user_id):
         )
         active_downloads[chat_id]["proc"] = proc
 
-        # ✅ Watchdog: يوقف إذا علق بدون output
         def watchdog():
             while proc.poll() is None and not cancel_event.is_set():
                 if time.time() - last_output_t > IDLE_TIMEOUT_SEC:
@@ -590,9 +552,8 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id, user_id):
                 except:
                     pass
                 log_stat({"ts": time.time(), "type": "cancel", "chat_id": chat_id, "domain": domain})
-                return None, None, None, "CANCELLED"
+                return None, None, None, None, "CANCELLED"
 
-            # تحديث حالة عامة إذا ماكو %
             if status_re.search(line):
                 now = time.time()
                 if (now - last_update_t) >= EDIT_THROTTLE_SEC:
@@ -645,7 +606,7 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id, user_id):
         ret = proc.wait()
 
         if timed_out_flag["hit"]:
-            return None, None, None, "TIMEOUT"
+            return None, None, None, None, "TIMEOUT"
 
         if cancel_event.is_set():
             try:
@@ -653,7 +614,7 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id, user_id):
             except:
                 pass
             log_stat({"ts": time.time(), "type": "cancel", "chat_id": chat_id, "domain": domain})
-            return None, None, None, "CANCELLED"
+            return None, None, None, None, "CANCELLED"
 
         if ret != 0:
             try:
@@ -665,7 +626,7 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id, user_id):
             except:
                 pass
             log_stat({"ts": time.time(), "type": "fail", "reason": "YT_DLP_ERROR", "chat_id": chat_id, "domain": domain})
-            return None, None, None, "YT_DLP_ERROR"
+            return None, None, None, None, "YT_DLP_ERROR"
 
         path = find_file(out_prefix)
         if not path:
@@ -674,9 +635,9 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id, user_id):
             except:
                 pass
             log_stat({"ts": time.time(), "type": "fail", "reason": "FILE_NOT_FOUND", "chat_id": chat_id, "domain": domain})
-            return None, None, None, "FILE_NOT_FOUND"
+            return None, None, None, None, "FILE_NOT_FOUND"
 
-        return path, title, channel, None
+        return path, title, channel, duration, None
 
     except:
         try:
@@ -684,9 +645,9 @@ def ytdlp_download_with_progress(url, mode, chat_id, msg_id, dl_id, user_id):
         except:
             pass
         log_stat({"ts": time.time(), "type": "fail", "reason": "RUNTIME_ERROR", "chat_id": chat_id, "domain": domain})
-        return None, None, None, "RUNTIME_ERROR"
+        return None, None, None, None, "RUNTIME_ERROR"
 
-def send_result(chat_id: int, msg_id: int, path: str, mode: str, title: str, channel: str):
+def send_result(chat_id: int, msg_id: int, path: str, mode: str, title: str, channel: str, duration: str):
     s = load_settings()
     bot_link = s.get("bot_public_username") or "@aass554411"
 
@@ -708,7 +669,6 @@ def send_result(chat_id: int, msg_id: int, path: str, mode: str, title: str, cha
 
     caption_tail = f"\n\n🔗 {bot_link}"
 
-    # ✅ بصمة: تيليجرام يفضّل OGG/OPUS
     if mode == "a_voice":
         final_path = path
         if has_ffmpeg() and not path.lower().endswith(".ogg"):
@@ -728,7 +688,7 @@ def send_result(chat_id: int, msg_id: int, path: str, mode: str, title: str, cha
                 bot.send_voice(
                     chat_id,
                     vf,
-                    caption=(f"🎙️ {title}" if title else "🎙️") + caption_tail
+                    caption=(f"🎙️ {title}\n⏱️ {duration}" if title else f"🎙️\n⏱️ {duration}") + caption_tail
                 )
         finally:
             if final_path != path:
@@ -736,22 +696,21 @@ def send_result(chat_id: int, msg_id: int, path: str, mode: str, title: str, cha
                     os.remove(final_path)
                 except:
                     pass
-
     else:
         with open(path, "rb") as f:
-            if mode in ("a_m4a", "a_mp3"):
+            if mode == "a_m4a":
                 bot.send_audio(
                     chat_id,
                     f,
                     title=title or "Audio",
                     performer=channel or "",
-                    caption=(f"🎵 {title}" if title else "🎵") + caption_tail
+                    caption=(f"🎵 {title}\n⏱️ {duration}" if title else f"🎵\n⏱️ {duration}") + caption_tail
                 )
             else:
                 bot.send_video(
                     chat_id,
                     f,
-                    caption=(f"🎬 {title}" if title else "🎬") + caption_tail,
+                    caption=(f"🎬 {title}\n⏱️ {duration}" if title else f"🎬\n⏱️ {duration}") + caption_tail,
                     supports_streaming=True
                 )
 
@@ -787,7 +746,7 @@ def handle_download(chat_id, url, mode, status_msg_id, user_id):
             "msg_id": status_msg_id
         }
 
-        path, title, channel, fail = ytdlp_download_with_progress(url, mode, chat_id, status_msg_id, dl_id, user_id)
+        path, title, channel, duration, fail = ytdlp_download_with_progress(url, mode, chat_id, status_msg_id, dl_id, user_id)
         if fail:
             return
 
@@ -799,7 +758,7 @@ def handle_download(chat_id, url, mode, status_msg_id, user_id):
             log_stat({"ts": time.time(), "type": "fail", "reason": "DOWNLOAD_FAILED", "chat_id": chat_id, "domain": domain})
             return
 
-        send_result(chat_id, status_msg_id, path, mode, title, channel)
+        send_result(chat_id, status_msg_id, path, mode, title, channel, duration)
         log_stat({
             "ts": time.time(),
             "type": "success",
@@ -937,7 +896,6 @@ def any_text(m):
         bot.send_message(m.chat.id, s["welcome_message"], reply_markup=start_keyboard(m.from_user.id))
         return
 
-    # ✅ زر الأدمن حتى لو وصل نصاً، ما يشتغل إلا للأدمن
     if txt == s["buttons"]["admin_btn"] and is_admin(m.from_user.id):
         admin_clear()
         bot.send_message(m.chat.id, "⚙️ <b>لوحة الأدمن</b>", reply_markup=admin_panel_kb())
@@ -983,14 +941,12 @@ def any_text(m):
     else:
         b = load_settings()["buttons"]
         kb.add(
-            types.InlineKeyboardButton(b["v720"], callback_data="v_720"),
-            types.InlineKeyboardButton(b["v480"], callback_data="v_480"),
-            types.InlineKeyboardButton(b["audio_m4a"], callback_data="a_m4a"),
-            types.InlineKeyboardButton(b["audio_mp3"], callback_data="a_mp3"),
+            types.InlineKeyboardButton(b["clip"], callback_data="v_clip"),
+            types.InlineKeyboardButton(b["audio_file"], callback_data="a_m4a"),
             types.InlineKeyboardButton(b["voice_note"], callback_data="a_voice"),
         )
 
-    bot.reply_to(m, "اختر الخيار 👇", reply_markup=kb)
+    bot.reply_to(m, "اختر نوع التحميل 👇", reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("force:check"))
 def force_check(c):
@@ -1040,7 +996,7 @@ def cancel_download(c):
     except:
         pass
 
-@bot.callback_query_handler(func=lambda c: c.data in ["ig_video", "v_720", "v_480", "a_m4a", "a_mp3", "a_voice"])
+@bot.callback_query_handler(func=lambda c: c.data in ["ig_video", "v_clip", "a_m4a", "a_voice"])
 def process_choice(c):
     chat_id = c.message.chat.id
     url = user_links.get(chat_id)
@@ -1092,15 +1048,12 @@ def admin_actions(c):
             c.message.chat.id,
             "🧷 ارسل صيغة تغيير الأزرار:\n"
             "<code>"
-            "v720=نص\nv480=نص\n"
-            "audio_m4a=نص\naudio_mp3=نص\nvoice_note=نص\n"
+            "clip=نص\naudio_file=نص\nvoice_note=نص\n"
             "ig_video=نص\nstart_btn=نص\nadmin_btn=نص\ncancel=نص"
             "</code>\n\n"
             "📌 الحالي:\n"
-            f"v720: {b['v720']}\n"
-            f"v480: {b['v480']}\n"
-            f"audio_m4a: {b['audio_m4a']}\n"
-            f"audio_mp3: {b['audio_mp3']}\n"
+            f"clip: {b['clip']}\n"
+            f"audio_file: {b['audio_file']}\n"
             f"voice_note: {b['voice_note']}\n"
             f"ig_video: {b['ig_video']}\n"
             f"start_btn: {b['start_btn']}\n"
@@ -1191,7 +1144,7 @@ def handle_admin_input(m, step: str, data: dict):
             if k and v:
                 updates[k] = v
 
-        allowed = {"v720", "v480", "audio_m4a", "audio_mp3", "voice_note", "ig_video", "start_btn", "admin_btn", "cancel"}
+        allowed = {"clip", "audio_file", "voice_note", "ig_video", "start_btn", "admin_btn", "cancel"}
         updates = {k: v for k, v in updates.items() if k in allowed}
 
         if not updates:
